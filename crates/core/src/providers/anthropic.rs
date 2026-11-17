@@ -74,6 +74,10 @@ impl Profile {
 /// Seam for tests and for callers that must not touch the network.
 pub trait ProfileSource {
     fn profile(&self, access_token: &str) -> Result<Profile>;
+
+    /// Exchange the refresh token of a login shaped like a saved Claude slot (`/login/claudeAiOauth/...`).
+    /// Returns the whole new blob. The old refresh token may be spent once the server answered.
+    fn refresh_login(&self, blob: &str, now: u64) -> std::result::Result<String, RefreshError>;
 }
 
 pub struct AnthropicApi {
@@ -208,6 +212,11 @@ pub fn apply_refresh(blob: &str, resp: &Value, now_ms: u64) -> Result<String> {
 }
 
 impl ProfileSource for AnthropicApi {
+    fn refresh_login(&self, blob: &str, now: u64) -> std::result::Result<String, RefreshError> {
+        // The inherent method (same name rules, different receiver path) holds the endpoint logic.
+        AnthropicApi::refresh(self, blob, now)
+    }
+
     fn profile(&self, access_token: &str) -> Result<Profile> {
         let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).max_redirects(0).build().into();
         let url = format!("{}/api/oauth/profile", self.base.trim_end_matches('/'));

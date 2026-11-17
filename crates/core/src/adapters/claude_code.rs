@@ -42,7 +42,8 @@ use crate::locks::{AccountLock, DirLock, DirLockOpts};
 use crate::paths::Paths;
 use crate::providers::anthropic::{AnthropicApi, Profile, ProfileSource};
 use crate::security_cli::{encode_add_line, SecurityCli};
-use crate::state::now_secs;
+use crate::state::{now_secs, State};
+use crate::token_refresh::{RefreshError, HALT_S};
 use crate::surface::{Env, Identity, Staged, Surface};
 use crate::vault::{lineage_fingerprint, normalize_blob, Slot};
 
@@ -54,6 +55,12 @@ pub const SHARED_KEYS: [&str; 5] = ["mcpOAuth", "mcpOAuthClientConfig", "mcpXaaI
 /// The transaction must not hold Claude Code's locks longer than this (their stale limit is 60 s).
 const HOLD_BUDGET: Duration = Duration::from_secs(5);
 const STORE: &str = "claude-oauth";
+/// A live access token this close to its expiry counts as expired (clock skew between us and the server).
+const EXPIRY_SKEW_MS: u64 = 60_000;
+/// Attempts to write a rotated live login; a lost write loses the only copy of the new refresh token.
+const LIVE_WRITE_ATTEMPTS: u32 = 3;
+/// The `claudeAiOauth` keys a token refresh changes. Every other key of the live login stays as it is.
+const ROTATED_KEYS: [&str; 4] = ["accessToken", "expiresAt", "refreshToken", "scopes"];
 const ENV_REFUSED: [&str; 3] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
 
 type Obj = Map<String, Value>;
@@ -294,6 +301,42 @@ struct Probe {
     error: Option<String>,
 }
 
+/// What `refresh_live` hands back to the probe.
+enum LiveRefresh {
+    /// The live login to probe next.
+    Login(Obj),
+    /// The refresh did not happen; the text says why, for the probe error.
+    Failed(String),
+}
+
+enum Committed {
+    /// The rotated tokens are in the live item; the login is what was written.
+    Written(Obj),
+    /// Claude Code replaced the live login in the meantime; it is left alone.
+    Raced(Obj),
+}
+
+/// `login` with the tokens of a refresh response applied; every other key stays.
+fn with_rotated_oauth(login: &Obj, new_oauth: &Obj) -> Obj {
+    let mut out = login.clone();
+    if let Some(oauth) = out.get_mut("claudeAiOauth").and_then(Value::as_object_mut) {
+        for k in ROTATED_KEYS {
+            if let Some(v) = new_oauth.get(k) {
+                oauth.insert(k.into(), v.clone());
+            }
+        }
+    }
+    out
+}
+
+fn probe_of(access: &str, answer: Result<Profile>) -> Probe {
+    Probe {
+        access_fp: lineage_fingerprint(access),
+        uuid: answer.as_ref().ok().map(|p| p.account_uuid.clone()),
+        error: answer.err().map(|e| e.to_string()),
+    }
+}
+
 fn classify(live_fp: &str, saved: &[SavedLogin], probe_uuid: Option<&str>) -> Owner {
     if let Some(s) = saved.iter().find(|s| s.fp == live_fp) {
         return Owner::Account(s.id.clone());
@@ -469,6 +512,115 @@ impl ClaudeCode {
         }
     }
 
+    /// Write the live login: the Keychain item, and the credentials file when it exists. Claude Code reads
+    /// that file instead of the Keychain when it exists, and drops its cached token when the file's mtime
+    /// changes (claude-swap `credentials.py:1033`). The file is never created.
+    fn write_live_item(&self, setup: &Setup, service: &str, text: &str) -> Result<()> {
+        self.live.set(service, &setup.user, text)?;
+        let creds_file = setup.credentials_file();
+        if std::fs::symlink_metadata(&creds_file).is_ok() {
+            (self.write_file)(&creds_file, text.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Ask the profile endpoint who owns the live login. When that fails because the access token expired,
+    /// refresh the live login once and ask again. Runs in `stage`, so no lock is held during the network calls.
+    fn probe_owner(&self, env: &Env, setup: &Setup, service: &str, live: &Obj) -> Result<Probe> {
+        let now = now_secs();
+        let access = token(live, "accessToken")?;
+        let first = self.profiles.profile(access);
+        let Err(first_err) = first else { return Ok(probe_of(access, first)) };
+        let expired = oauth_of(live)?.get("expiresAt").and_then(Value::as_u64).is_some_and(|ms| ms <= now * 1000 + EXPIRY_SKEW_MS);
+        if !expired || State::load(env.paths)?.refresh_halted(now) {
+            return Ok(probe_of(access, Err(first_err)));
+        }
+        match self.refresh_live(env, setup, service, live, now)? {
+            LiveRefresh::Login(login) => {
+                let access = token(&login, "accessToken")?;
+                Ok(probe_of(access, self.profiles.profile(access)))
+            }
+            LiveRefresh::Failed(why) => {
+                let error = format!("{first_err}; refreshing the expired login also failed: {why}");
+                Ok(probe_of(access, Err(Error::Invalid(error))))
+            }
+        }
+    }
+
+    /// Refresh the live login with its refresh token and write the rotated tokens back, keeping every other
+    /// key. `Login` is the live login to probe next: the rotated one, or a newer one that Claude Code wrote
+    /// while the request was in flight (that one is never overwritten).
+    fn refresh_live(&self, env: &Env, setup: &Setup, service: &str, live: &Obj, now: u64) -> Result<LiveRefresh> {
+        let old_fp = fingerprint_of(live)?;
+        let blob = serde_json::to_string(&ClaudeSlot::new(live.clone(), Value::Object(Obj::new()))).map_err(|e| Error::Invalid(e.to_string()))?;
+        let rotated_blob = match self.profiles.refresh_login(&blob, now) {
+            Ok(b) => b,
+            Err(RefreshError::Dead(m)) => {
+                return Err(Error::Invalid(format!(
+                    "the live Claude Code login expired and its refresh token was rejected ({m}). Sign in to Claude Code again, then retry. Nothing was changed"
+                )));
+            }
+            Err(RefreshError::Systemic(m)) => {
+                State::update(env.paths, |s| s.refresh_halted_until = Some(now + HALT_S))?;
+                return Ok(LiveRefresh::Failed(m));
+            }
+            Err(RefreshError::Transient { detail, .. }) => return Ok(LiveRefresh::Failed(detail)),
+        };
+        let new_oauth: Obj = serde_json::from_str::<Value>(&rotated_blob)
+            .ok()
+            .and_then(|v| v.pointer("/login/claudeAiOauth").and_then(Value::as_object).cloned())
+            .ok_or_else(|| Error::Invalid("the token endpoint's answer has no login in it".into()))?;
+        match self.commit_rotated(setup, service, &old_fp, &new_oauth) {
+            Ok(Committed::Written(login) | Committed::Raced(login)) => Ok(LiveRefresh::Login(login)),
+            Err(e) => {
+                // The server rotated the refresh token, so the live one is spent. Keep the new login.
+                let rotated = with_rotated_oauth(live, &new_oauth);
+                let new_fp = fingerprint_of(&rotated).unwrap_or(old_fp);
+                let kept = self.quarantine(env, setup, &rotated, &new_fp);
+                let copy = match &kept {
+                    Ok(stash) => format!("A recovery copy of the new login was kept as `{stash}` (listed by `agent-switch doctor`; delete it with `agent-switch remove {stash}`)."),
+                    Err(qe) => format!("The new login could not be kept either ({qe})."),
+                };
+                Err(Error::Invalid(format!(
+                    "the live Claude Code login was refreshed, but the new login could not be written back ({e}), so the old one no longer works. Sign in to Claude Code again. {copy}"
+                )))
+            }
+        }
+    }
+
+    /// Write the rotated tokens into the live item, under Claude Code's refresh locks, unless the live item
+    /// no longer holds the login that was refreshed.
+    fn commit_rotated(&self, setup: &Setup, service: &str, old_fp: &str, new_oauth: &Obj) -> Result<Committed> {
+        let _refresh = DirLock::acquire(&setup.refresh_lock(), DirLockOpts::credentials())?;
+        let _legacy = DirLock::acquire(&setup.legacy_lock(), DirLockOpts::credentials())?;
+        let mut last = None;
+        for attempt in 0..LIVE_WRITE_ATTEMPTS {
+            let tried = (|| -> Result<Committed> {
+                let text = self.live.get(service, &setup.user)?.ok_or_else(|| Error::Invalid("the live login item disappeared".into()))?;
+                let current = parse_login(&text)?;
+                if fingerprint_of(&current)? != old_fp {
+                    return Ok(Committed::Raced(current));
+                }
+                let merged = with_rotated_oauth(&current, new_oauth);
+                let merged_text = compact_ascii(&merged)?;
+                encode_add_line(service, &setup.user, &merged_text).map_err(|e| match e {
+                    Error::TooLarge { len, limit } => Error::Invalid(format!("the refreshed login is too large for /usr/bin/security's stdin limit ({len} > {limit} bytes)")),
+                    other => other,
+                })?;
+                self.write_live_item(setup, service, &merged_text)?;
+                Ok(Committed::Written(merged))
+            })();
+            match tried {
+                Ok(c) => return Ok(c),
+                Err(e) => last = Some(e),
+            }
+            if attempt + 1 < LIVE_WRITE_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Keychain("live login write failed".into())))
+    }
+
     /// Keep a recovery copy of a live login nobody saved. One copy per login, at most a few in total, listed
     /// by `doctor` and deleted by `remove`.
     fn quarantine(&self, env: &Env, setup: &Setup, live: &Obj, fp: &str) -> Result<String> {
@@ -574,12 +726,7 @@ impl ClaudeCode {
 
         Self::check_file_targets(setup, &creds_file, original_creds_file.is_some())?;
         let write_result = (|| -> Result<()> {
-            self.live.set(&service, &setup.user, &merged_text)?;
-            if original_creds_file.is_some() {
-                // Claude Code reads this file instead of the Keychain when it exists, and drops its cached
-                // token when the file's mtime changes (claude-swap `credentials.py:1033`). Never created.
-                (self.write_file)(&creds_file, merged_text.as_bytes())?;
-            }
+            self.write_live_item(setup, &service, &merged_text)?;
             Self::check_budget(started, "writing the identity")?;
             self.write_identity(setup, &target.oauth_account)
         })();
@@ -1019,17 +1166,11 @@ impl Surface for ClaudeCode {
         // Ask who owns the live login now, before any lock is held (network under locks is forbidden).
         let setup = self.setup(env);
         let mut probe = None;
-        if let (_, Some(text)) = self.read_live(&setup)? {
+        if let (service, Some(text)) = self.read_live(&setup)? {
             let live = parse_login(&text)?;
             let fp = fingerprint_of(&live)?;
             if !self.saved_logins(env)?.iter().any(|s| s.fp == fp) {
-                let access = token(&live, "accessToken")?;
-                let answer = self.profiles.profile(access);
-                probe = Some(Probe {
-                    access_fp: lineage_fingerprint(access),
-                    uuid: answer.as_ref().ok().map(|p| p.account_uuid.clone()),
-                    error: answer.err().map(|e| e.to_string()),
-                });
+                probe = Some(self.probe_owner(env, &setup, &service, &live)?);
             }
         }
         let payload = serde_json::to_vec(&StagePayload { slot: slot.blob, probe }).map_err(|e| Error::Invalid(e.to_string()))?;

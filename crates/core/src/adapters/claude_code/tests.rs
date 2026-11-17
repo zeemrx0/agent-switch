@@ -8,6 +8,7 @@ use serde_json::json;
 use super::*;
 use crate::config::Binding;
 use crate::keychain::MemoryKeychain;
+use crate::token_refresh::RefreshError;
 use crate::state::State;
 use crate::switch;
 use crate::vault::Vault;
@@ -23,6 +24,7 @@ const USER: &str = "tester";
 struct Flaky {
     inner: MemoryKeychain,
     fail_next_set: AtomicBool,
+    fail_every_set: AtomicBool,
 }
 
 impl Keychain for Flaky {
@@ -30,7 +32,7 @@ impl Keychain for Flaky {
         self.inner.get(s, a)
     }
     fn set(&self, s: &str, a: &str, v: &str) -> Result<()> {
-        if self.fail_next_set.swap(false, Ordering::SeqCst) {
+        if self.fail_next_set.swap(false, Ordering::SeqCst) || self.fail_every_set.load(Ordering::SeqCst) {
             return Err(Error::Keychain("injected failure".into()));
         }
         self.inner.set(s, a, v)
@@ -48,6 +50,11 @@ impl Keychain for Flaky {
 struct FakeProfiles {
     by_token: Mutex<HashMap<String, String>>,
     calls: AtomicUsize,
+    /// What the next refresh answers: `Ok` rotates to `acc-new` / `ref-new`; unset is a transient failure.
+    refresh_reply: Mutex<Option<std::result::Result<(), RefreshError>>>,
+    refresh_calls: AtomicUsize,
+    /// Runs inside a refresh request, to play what Claude Code does while the request is in flight.
+    during_refresh: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl FakeProfiles {
@@ -57,6 +64,21 @@ impl FakeProfiles {
 }
 
 impl ProfileSource for FakeProfiles {
+    fn refresh_login(&self, blob: &str, now: u64) -> std::result::Result<String, RefreshError> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(hook) = self.during_refresh.lock().unwrap().as_ref() {
+            hook();
+        }
+        match self.refresh_reply.lock().unwrap().clone() {
+            Some(Ok(())) => {
+                let resp = json!({"access_token": "acc-new", "expires_in": 3600, "refresh_token": "ref-new", "scope": "user:inference user:profile"});
+                Ok(crate::providers::anthropic::apply_refresh(blob, &resp, now * 1000).unwrap())
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(RefreshError::Transient { detail: "the token endpoint answered HTTP 503".into(), may_have_consumed: false }),
+        }
+    }
+
     fn profile(&self, access_token: &str) -> Result<Profile> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.by_token.lock().unwrap().get(access_token) {
@@ -499,6 +521,163 @@ fn an_unverifiable_live_login_stops_with_a_retry_hint() {
     assert!(err.contains("could not be matched to a saved account") && err.contains("401") && err.contains("retry"), "{err}");
     assert!(fx.vault.get(&format!("quarantine-{}", lineage_fingerprint("ref-new")), STORE).unwrap().is_some());
     assert_eq!(token(&fx.slot("personal").login, "refreshToken").unwrap(), "ref-P1");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Refreshing an expired live login
+// ---------------------------------------------------------------------------------------------
+
+/// The live login after Claude Code rotated its refresh token and the access token expired: no saved
+/// fingerprint matches and the profile endpoint refuses the old access token.
+fn expire_live(fx: &Fx, expires_at: u64) {
+    let mut live = fx.live_obj();
+    live.insert("claudeAiOauth".into(), json!({"accessToken": "acc-P2", "refreshToken": "ref-P2", "expiresAt": expires_at, "subscriptionType": "max"}));
+    fx.set_live(&live);
+}
+
+fn stage_team(fx: &Fx, adapter: &ClaudeCode) -> Result<Staged> {
+    let config = fx.config();
+    adapter.stage(&fx.env(), config.account("team").unwrap())
+}
+
+#[test]
+fn an_expired_live_login_is_refreshed_in_place_and_keeps_its_other_keys() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    let creds_file = fx.paths.home().join(".claude").join(".credentials.json");
+    std::fs::write(&creds_file, "{}").unwrap();
+    fx.profiles.know("acc-new", "u-personal");
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Ok(()));
+    let before = fx.live_obj();
+
+    stage_team(&fx, &fx.adapter()).unwrap();
+
+    let live = fx.live_obj();
+    let oauth = oauth_of(&live).unwrap();
+    assert_eq!((oauth["accessToken"].as_str(), oauth["refreshToken"].as_str()), (Some("acc-new"), Some("ref-new")));
+    assert_eq!(oauth["scopes"], json!(["user:inference", "user:profile"]));
+    assert!(oauth["expiresAt"].as_u64().unwrap() > now_secs() * 1000);
+    assert_eq!(oauth["subscriptionType"], "max");
+    for key in ["mcpOAuth", "trustedDeviceToken", "unknownP", "unknownLiveOnly"] {
+        assert_eq!(live.get(key), before.get(key), "{key} must stay as it was");
+    }
+    assert_eq!(std::fs::read_to_string(&creds_file).unwrap(), fx.live_text(), "a running Claude Code notices the new file");
+    assert_eq!(fx.profiles.refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_switch_proceeds_once_the_expired_live_login_is_refreshed() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    fx.profiles.know("acc-new", "u-personal");
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Ok(()));
+
+    fx.switch(&fx.adapter(), "team").unwrap();
+
+    assert_eq!(access(&fx.live_obj()), "acc-T1");
+    assert_eq!(fx.live_obj().get("mcpOAuth"), Some(&serde_json::from_str::<Value>(MCP).unwrap()));
+    assert_eq!(token(&fx.slot("personal").login, "refreshToken").unwrap(), "ref-new", "the outgoing login is saved back");
+    assert!(State::load(&fx.paths).unwrap().quarantine.is_empty());
+}
+
+#[test]
+fn a_live_login_that_is_still_valid_is_never_refreshed() {
+    let fx = Fx::new();
+    expire_live(&fx, (now_secs() + 3600) * 1000);
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Ok(()));
+    let live_before = fx.live_text();
+
+    let err = fx.switch(&fx.adapter(), "team").unwrap_err().to_string();
+
+    assert!(err.contains("could not be matched to a saved account") && err.contains("401"), "{err}");
+    assert_eq!(fx.profiles.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fx.live_text(), live_before);
+}
+
+#[test]
+fn a_live_login_that_claude_code_replaced_during_the_refresh_is_not_overwritten() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    fx.profiles.know("acc-P3", "u-personal");
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Ok(()));
+    let (live, user) = (fx.live.clone(), USER);
+    let mut newer = fx.live_obj();
+    newer.insert("claudeAiOauth".into(), json!({"accessToken": "acc-P3", "refreshToken": "ref-P3", "expiresAt": 4_000_000_000_000u64, "subscriptionType": "max"}));
+    let newer_text = compact_ascii(&newer).unwrap();
+    *fx.profiles.during_refresh.lock().unwrap() = Some(Box::new(move || live.set(LIVE_SERVICE, user, &newer_text).unwrap()));
+
+    fx.switch(&fx.adapter(), "team").unwrap();
+
+    assert_eq!(fx.profiles.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(token(&fx.slot("personal").login, "refreshToken").unwrap(), "ref-P3", "the newer login, not ours, was saved back");
+    assert!(!fx.vault.get("personal", STORE).unwrap().unwrap().blob.contains("ref-new"));
+}
+
+#[test]
+fn a_rejected_live_refresh_token_asks_for_a_new_sign_in_and_writes_nothing() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Err(RefreshError::Dead("the refresh token was rejected (invalid_grant)".into())));
+    let (live_before, personal_before) = (fx.live_text(), fx.vault.get("personal", STORE).unwrap());
+
+    let err = fx.switch(&fx.adapter(), "team").unwrap_err().to_string();
+
+    assert!(err.contains("Sign in to Claude Code again") && err.contains("invalid_grant"), "{err}");
+    assert_eq!(fx.live_text(), live_before);
+    assert_eq!(fx.vault.get("personal", STORE).unwrap(), personal_before);
+}
+
+#[test]
+fn a_rotated_login_that_cannot_be_written_back_is_kept_as_a_recovery_copy() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Ok(()));
+    fx.live.fail_every_set.store(true, Ordering::SeqCst);
+
+    let err = fx.switch(&fx.adapter(), "team").unwrap_err().to_string();
+
+    let stash = format!("quarantine-{}", lineage_fingerprint("ref-new"));
+    assert!(err.contains("Sign in to Claude Code again") && err.contains(&stash) && err.contains("injected failure"), "{err}");
+    let kept = ClaudeSlot::parse(&fx.vault.get(&stash, STORE).unwrap().unwrap().blob).unwrap();
+    assert_eq!((access(&kept.login).as_str(), token(&kept.login, "refreshToken").unwrap()), ("acc-new", "ref-new"));
+    assert!(State::load(&fx.paths).unwrap().quarantine.contains_key(&stash));
+}
+
+#[test]
+fn a_halted_refresh_is_not_attempted() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Ok(()));
+    State::update(&fx.paths, |s| s.refresh_halted_until = Some(now_secs() + 3600)).unwrap();
+
+    let err = fx.switch(&fx.adapter(), "team").unwrap_err().to_string();
+
+    assert!(err.contains("could not be matched to a saved account"), "{err}");
+    assert_eq!(fx.profiles.refresh_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_rejected_client_halts_refreshes_and_the_switch_stops_as_before() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    *fx.profiles.refresh_reply.lock().unwrap() = Some(Err(RefreshError::Systemic("the token endpoint rejected agent-switch's client (invalid_client)".into())));
+
+    let err = fx.switch(&fx.adapter(), "team").unwrap_err().to_string();
+
+    assert!(err.contains("could not be matched to a saved account") && err.contains("invalid_client"), "{err}");
+    assert!(State::load(&fx.paths).unwrap().refresh_halted(now_secs()));
+}
+
+#[test]
+fn a_transient_refresh_failure_is_named_in_the_refusal() {
+    let fx = Fx::new();
+    expire_live(&fx, 1);
+    let live_before = fx.live_text();
+
+    let err = fx.switch(&fx.adapter(), "team").unwrap_err().to_string();
+
+    assert!(err.contains("could not be matched to a saved account") && err.contains("401") && err.contains("HTTP 503"), "{err}");
+    assert_eq!(fx.live_text(), live_before, "nothing was written to the live item");
 }
 
 #[test]
