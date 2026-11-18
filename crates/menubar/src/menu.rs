@@ -80,7 +80,7 @@ pub struct AccountRow {
 pub enum Usage {
     /// One bar per window that was read.
     Bars(Vec<Bar>),
-    /// Why there are no bars: `no reading yet`, `login expired`, `sign in again` or `unreadable`.
+    /// Why there are no bars: `no reading yet`, `login expired`, `sign in again`, `rate limited` or `unreadable`.
     Note(&'static str),
 }
 
@@ -129,10 +129,16 @@ pub fn tier(remaining: u8, threshold: u8) -> Tier {
     }
 }
 
-/// The bars of a reading: one per window it has. None when there is no reading or it is not a clean one
-/// (expired, dead, unreadable); `usage` then gives the note instead.
+/// Whether the last poll was refused with HTTP 429. The record then still holds the reading before it.
+fn rate_limited(rec: Option<&UsageRecord>) -> bool {
+    rec.is_some_and(|r| r.state == UsageState::Unreadable && r.detail.as_deref() == Some("http-429"))
+}
+
+/// The bars of a reading: one per window it has. A rate-limited record keeps its bars while its last
+/// reading is fresh. None when there is no reading or it is not a clean one (expired, dead, unreadable,
+/// rate limited with an old reading); `usage` then gives the note instead.
 pub fn usage_bars(rec: Option<&UsageRecord>, now: u64, threshold: u8) -> Vec<Bar> {
-    let Some(r) = rec.filter(|r| r.state == UsageState::Ok) else { return Vec::new() };
+    let Some(r) = rec.filter(|r| r.state == UsageState::Ok || (rate_limited(Some(r)) && !policy::is_stale(Some(r), now))) else { return Vec::new() };
     [("5h", &r.windows.five_hour), ("wk", &r.windows.weekly)]
         .into_iter()
         .filter_map(|(window, snap)| {
@@ -153,6 +159,7 @@ pub fn usage(rec: Option<&UsageRecord>, now: u64, threshold: u8) -> Usage {
         None | Some(UsageState::Ok) => "no reading yet",
         Some(UsageState::Expired) => "login expired",
         Some(UsageState::Dead) => "sign in again",
+        Some(UsageState::Unreadable) if rate_limited(rec) => "rate limited",
         Some(UsageState::Unreadable) => "unreadable",
     })
 }
@@ -323,7 +330,12 @@ fn info_lines(rec: Option<&UsageRecord>, usage: &Usage, now: u64) -> Vec<Entry> 
     }
     if let Some(at) = rec.fetched_at {
         let age = now.saturating_sub(at);
-        out.push(Entry::disabled(if age < 60 { "Updated just now".to_string() } else { format!("Updated {} ago", span(age)) }));
+        out.push(Entry::disabled(match (rate_limited(Some(rec)), age < 60) {
+            (true, true) => "Rate limited · last read just now".to_string(),
+            (true, false) => format!("Rate limited · last read {} ago", span(age)),
+            (false, true) => "Updated just now".to_string(),
+            (false, false) => format!("Updated {} ago", span(age)),
+        }));
     }
     out
 }
@@ -1110,6 +1122,44 @@ Claude >
         let long = account("y", Provider::Claude, &"w".repeat(200));
         assert_eq!(account_label(&long).chars().count(), MAX_LABEL_CHARS);
         assert_eq!(account_label(&account("z", Provider::Claude, "  ")), "z", "an empty label falls back to the id");
+    }
+
+    #[test]
+    fn a_rate_limited_account_keeps_a_fresh_reading_and_says_why() {
+        let mut r = reading(32.0, 40.0);
+        r.state = UsageState::Unreadable;
+        r.detail = Some("http-429".into());
+        r.fetched_at = Some(NOW - 300);
+        assert_eq!(usage(Some(&r), NOW, 90), bars((32, Tier::Plenty), (40, Tier::Plenty)));
+        let mut s = State::default();
+        s.usage.insert("personal".into(), r);
+        let entries = build(&config(), &s, &ctx());
+        let row = find_row(&entries, "Personal");
+        assert!(matches!(row.usage, Usage::Bars(_)));
+        let text = to_text(&row.children);
+        assert!(text.contains("Rate limited · last read 5m ago"), "{text}");
+        assert!(!text.contains("Updated"), "{text}");
+    }
+
+    #[test]
+    fn a_rate_limited_account_without_a_usable_reading_says_rate_limited() {
+        let mut stale = reading(32.0, 40.0);
+        stale.state = UsageState::Unreadable;
+        stale.detail = Some("http-429".into());
+        stale.fetched_at = Some(NOW - policy::STALE_AFTER_S - 1);
+        assert_eq!(usage(Some(&stale), NOW, 90), Usage::Note("rate limited"));
+        let none = UsageRecord { state: UsageState::Unreadable, detail: Some("http-429".into()), ..UsageRecord::default() };
+        assert_eq!(usage(Some(&none), NOW, 90), Usage::Note("rate limited"));
+    }
+
+    #[test]
+    fn another_unreadable_detail_shows_no_bars() {
+        let mut r = reading(32.0, 40.0);
+        r.state = UsageState::Unreadable;
+        r.detail = Some("http-503".into());
+        assert_eq!(usage(Some(&r), NOW, 90), Usage::Note("unreadable"));
+        r.detail = None;
+        assert_eq!(usage(Some(&r), NOW, 90), Usage::Note("unreadable"));
     }
 
     #[test]
