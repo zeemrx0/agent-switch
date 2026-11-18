@@ -679,7 +679,7 @@ mod tests {
     fn switches_the_cli_once_at_91_and_does_not_flip_back_at_88() {
         let r = claude3();
         r.f.api.script_usage("a", vec![ok(91.0, 10.0), ok(88.0, 10.0)]);
-        r.f.api.script_usage("b", vec![ok(10.0, 10.0), ok(10.0, 10.0), ok(91.0, 10.0)]);
+        r.f.api.script_usage("b", vec![ok(10.0, 10.0), ok(10.0, 10.0), ok(10.0, 10.0), ok(91.0, 10.0)]);
         r.f.api.script_usage("c", vec![ok(10.0, 10.0)]);
         r.run(|w| {
             w.tick(T0).unwrap();

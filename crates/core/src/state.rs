@@ -263,6 +263,9 @@ impl State {
         if self.pending(kind).is_some_and(|p| p.reason == REASON_SWITCH_NEEDED && p.target_account == new_account_id) {
             self.set_pending(kind, None);
         }
+        if let Some(rec) = self.usage.get_mut(new_account_id) {
+            crate::policy::due_on_activation(rec, at);
+        }
         self.journal.push(SwitchRecord { surface: kind, previous_account_id: previous, new_account_id: new_account_id.into(), at });
         if self.journal.len() > JOURNAL_LIMIT {
             let excess = self.journal.len() - JOURNAL_LIMIT;
@@ -306,6 +309,54 @@ mod tests {
         let r = s.journal.last().unwrap();
         assert_eq!(r.previous_account_id.as_deref(), Some("personal"));
         assert_eq!(r.new_account_id, "team");
+    }
+
+    fn usage_rec(next_poll_at: u64, pct: f64) -> UsageRecord {
+        let w = WindowSnap { pct, resets_at: None };
+        UsageRecord {
+            state: UsageState::Ok,
+            windows: Windows { five_hour: Some(w), weekly: None },
+            checked_at: 1000,
+            next_poll_at,
+            interval_s: 600,
+            ..UsageRecord::default()
+        }
+    }
+
+    #[test]
+    fn record_switch_pulls_the_new_active_polls_forward() {
+        let mut s = State::default();
+        s.usage.insert("a".into(), usage_rec(1660, 10.0));
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1400);
+        let r = &s.usage["a"];
+        assert_eq!((r.next_poll_at, r.interval_s), (1180, 180));
+        // An earlier schedule is never pushed back.
+        s.usage.insert("b".into(), usage_rec(1100, 10.0));
+        s.record_switch(SurfaceKind::ClaudeCli, "b", 1400);
+        assert_eq!(s.usage["b"].next_poll_at, 1100);
+    }
+
+    #[test]
+    fn record_switch_keeps_the_schedule_after_a_recent_429() {
+        let mut s = State::default();
+        s.usage.insert("a".into(), UsageRecord { last_429_at: Some(1300), ..usage_rec(1660, 10.0) });
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1400);
+        assert_eq!((s.usage["a"].next_poll_at, s.usage["a"].interval_s), (1660, 600));
+    }
+
+    #[test]
+    fn record_switch_keeps_the_schedule_of_an_exhausted_account() {
+        let mut s = State::default();
+        s.usage.insert("a".into(), usage_rec(1660, 100.0));
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1400);
+        assert_eq!((s.usage["a"].next_poll_at, s.usage["a"].interval_s), (1660, 600));
+    }
+
+    #[test]
+    fn record_switch_without_a_usage_record_adds_none() {
+        let mut s = State::default();
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1400);
+        assert!(s.usage.is_empty());
     }
 
     #[test]

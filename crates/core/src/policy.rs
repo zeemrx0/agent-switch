@@ -73,6 +73,19 @@ fn recent_429(prev: Option<&UsageRecord>, now: u64) -> bool {
     prev.and_then(|p| p.last_429_at).is_some_and(|t| now.saturating_sub(t) < RECENT_429_WINDOW_S)
 }
 
+/// Called when an account becomes active: pulls its schedule forward so the next poll is at most
+/// `MIN_INTERVAL_S` after the last attempt, never sooner, so the endpoint's hourly request limit still
+/// holds. A recent 429 or an exhausted reading keeps its slower cadence.
+pub fn due_on_activation(rec: &mut UsageRecord, now: u64) {
+    if recent_429(Some(rec), now) || exhausted(&rec.windows, now) {
+        return;
+    }
+    rec.next_poll_at = rec.next_poll_at.min(rec.checked_at + MIN_INTERVAL_S);
+    if rec.interval_s > 0 {
+        rec.interval_s = rec.interval_s.min(MIN_INTERVAL_S);
+    }
+}
+
 /// `(next_poll_at, interval_s, urgent_streak)` after a successful reading.
 ///
 /// Movement halves the interval (never below 180 s); a still account backs off x1.5 toward its ceiling; the
