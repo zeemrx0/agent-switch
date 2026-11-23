@@ -22,7 +22,8 @@
 //! * **CLI surfaces switch now. Desktop surfaces only raise an event** (`Outcome::Notify`); an app is never
 //!   quit without a click. `codex-cli_mode = notify` makes the Codex CLI behave like a Desktop surface.
 //! * **Cadence.** At most one usage request per 180 s per account; a rising window of the active account near
-//!   its line polls every 60 s, bounded to 15 polls in a row; a 429 stretches the interval; an exhausted
+//!   its line polls every 60 s, bounded to 15 polls in a row; a 429 waits its `Retry-After` (at least 6
+//!   minutes), and the first good reading after it returns to the normal cadence; an exhausted
 //!   account is polled every 10 minutes (claude-swap `poll_policy.py`, measured limit about 28-30 requests per
 //!   rolling hour).
 
@@ -37,7 +38,6 @@ pub const CANDIDATE_DEFAULT_INTERVAL_S: u64 = 300;
 pub const CANDIDATE_MAX_INTERVAL_S: u64 = 600;
 pub const EXHAUSTED_INTERVAL_S: u64 = 600;
 pub const POST_429_MIN_INTERVAL_S: u64 = 360;
-pub const POST_429_MAX_INTERVAL_S: u64 = 1800;
 pub const RECENT_429_WINDOW_S: u64 = 3600;
 /// An urgent poll needs a window within this many points of the threshold.
 pub const ESCALATION_MARGIN_PCT: f64 = 15.0;
@@ -90,8 +90,9 @@ pub fn due_on_activation(rec: &mut UsageRecord, now: u64) {
 ///
 /// Movement halves the interval (never below 180 s); a still account backs off x1.5 toward its ceiling; the
 /// active account with a window that rose into the band below its line polls every 60 s, at most
-/// `MAX_URGENT_STREAK` times in a row; a recent 429 floors the cadence at 360 s and suppresses urgent mode
-/// (`poll_policy.py:plan_after_fetch`).
+/// `MAX_URGENT_STREAK` times in a row; a recent 429 suppresses urgent mode but does not slow the cadence, so
+/// readings return to normal as soon as the endpoint answers again. The interval never exceeds the ceiling,
+/// so a long wait after a 429 does not carry over.
 pub fn plan_after_fetch(prev: Option<&UsageRecord>, new: &Windows, is_active: bool, threshold: u8, now: u64, jitter: f64) -> (u64, u64, u32) {
     let default = if is_active { MIN_INTERVAL_S } else { CANDIDATE_DEFAULT_INTERVAL_S };
     let ceiling = if is_active { ACTIVE_MAX_INTERVAL_S } else { CANDIDATE_MAX_INTERVAL_S };
@@ -120,10 +121,7 @@ pub fn plan_after_fetch(prev: Option<&UsageRecord>, new: &Windows, is_active: bo
             streak += 1;
         }
     }
-    if recent {
-        let widened = (base * 3 / 2).max(POST_429_MIN_INTERVAL_S);
-        interval = POST_429_MAX_INTERVAL_S.min(interval.max(widened));
-    }
+    interval = interval.min(ceiling);
     let exhausted = raw_worst(new).is_some_and(|p| p >= 100.0);
     if exhausted {
         // Keep probing: a quota grant can arrive before the advertised reset.
@@ -141,8 +139,8 @@ pub fn plan_after_fetch(prev: Option<&UsageRecord>, new: &Windows, is_active: bo
     (next, interval, streak)
 }
 
-/// `(next_poll_at, interval_s)` after a reading that produced no numbers. A 429 stretches the interval
-/// (AIMD, `poll_policy.py`), honoring `Retry-After`; other failures back off toward 10 minutes; an expired
+/// `(next_poll_at, interval_s)` after a reading that produced no numbers. A 429 waits its `Retry-After`
+/// plus a minute, at least `POST_429_MIN_INTERVAL_S`, without compounding across 429s; other failures back off toward 10 minutes; an expired
 /// token is only a local check, so it keeps the 180 s cadence; a dead login is rechecked every 10 minutes
 /// in case a new sign-in replaced it. A request that never reached the server (offline) is retried after a
 /// minute and keeps the stored interval, so an outage does not stretch the cadence.
@@ -156,12 +154,8 @@ pub fn plan_after_failure(prev: Option<&UsageRecord>, rec: &UsageRecord, retry_a
         UsageState::Expired | UsageState::Ok => MIN_INTERVAL_S,
         UsageState::Unreadable => CANDIDATE_MAX_INTERVAL_S.min(MIN_INTERVAL_S.max(base * 3 / 2)),
     };
-    if rec.last_429_at == Some(now) || recent_429(prev, now) {
-        let widened = (base * 3 / 2).max(POST_429_MIN_INTERVAL_S);
-        interval = POST_429_MAX_INTERVAL_S.min(interval.max(widened));
-    }
-    if let Some(wait) = retry_after_s.filter(|_| rec.last_429_at == Some(now)) {
-        interval = interval.max(wait + RESET_SLACK_S);
+    if rec.last_429_at == Some(now) {
+        interval = POST_429_MIN_INTERVAL_S.max(retry_after_s.map_or(0, |wait| wait + RESET_SLACK_S));
     }
     (schedule(now, interval, jitter), interval)
 }
@@ -914,18 +908,20 @@ mod tests {
     }
 
     #[test]
-    fn a_429_stretches_the_interval_and_suppresses_urgent_mode() {
+    fn the_first_reading_after_a_429_returns_to_the_normal_cadence_without_urgent_polls() {
         let mut prev = rec(70.0, 10.0);
         prev.last_429_at = Some(T0 - 100);
         prev.interval_s = 180;
         let (_, interval, streak) = fetched(Some(&prev), &windows(76.0, 10.0), true, T0);
-        assert_eq!((interval, streak), (360, 0), "floor of 360 s, no urgent polls");
-        prev.interval_s = 360;
-        assert_eq!(fetched(Some(&prev), &windows(70.0, 10.0), true, T0).1, 540, "x1.5 while 429s linger");
-        prev.interval_s = 1700;
-        assert_eq!(fetched(Some(&prev), &windows(70.0, 10.0), true, T0).1, POST_429_MAX_INTERVAL_S);
-        // An hour later the 429 is forgotten.
-        assert!(fetched(Some(&prev), &windows(70.0, 10.0), true, T0 + RECENT_429_WINDOW_S).1 <= 300);
+        assert_eq!((interval, streak), (MIN_INTERVAL_S, 0), "normal cadence, no urgent polls while a 429 is recent");
+        // A long wait after a 429 does not carry over: the active account is back within its ceiling.
+        prev.interval_s = 1365;
+        assert_eq!(fetched(Some(&prev), &windows(70.0, 10.0), true, T0).1, ACTIVE_MAX_INTERVAL_S);
+        assert_eq!(fetched(Some(&prev), &windows(80.0, 10.0), true, T0).1, ACTIVE_MAX_INTERVAL_S, "movement too");
+        assert_eq!(fetched(Some(&prev), &windows(70.0, 10.0), false, T0).1, CANDIDATE_MAX_INTERVAL_S);
+        // An hour later urgent polls are allowed again.
+        prev.interval_s = 180;
+        assert_eq!(fetched(Some(&prev), &windows(76.0, 10.0), true, T0 + RECENT_429_WINDOW_S).1, URGENT_INTERVAL_S);
     }
 
     #[test]
@@ -936,6 +932,12 @@ mod tests {
         assert_eq!((interval, next), (360, T0 + 360));
         let (_, interval) = plan_after_failure(Some(&prev), &failed, Some(900), T0, 0.0);
         assert_eq!(interval, 960, "Retry-After plus a minute");
+        assert_eq!(plan_after_failure(Some(&prev), &failed, Some(60), T0, 0.0).1, 360, "never under the 429 floor");
+        // A second 429 in a row waits the same, it does not compound.
+        let mut again = prev.clone();
+        again.interval_s = 360;
+        again.last_429_at = Some(T0 - 360);
+        assert_eq!(plan_after_failure(Some(&again), &failed, None, T0, 0.0).1, 360);
         failed.last_429_at = None;
         failed.state = UsageState::Unreadable;
         assert_eq!(plan_after_failure(Some(&prev), &failed, None, T0, 0.0).1, 270, "other failures back off gently");
