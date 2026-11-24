@@ -266,6 +266,9 @@ impl State {
         if let Some(rec) = self.usage.get_mut(new_account_id) {
             crate::policy::due_on_activation(rec, at);
         }
+        if let Some(rec) = previous.as_deref().filter(|p| *p != new_account_id).and_then(|p| self.usage.get_mut(p)) {
+            crate::policy::due_on_release(rec, at);
+        }
         self.journal.push(SwitchRecord { surface: kind, previous_account_id: previous, new_account_id: new_account_id.into(), at });
         if self.journal.len() > JOURNAL_LIMIT {
             let excess = self.journal.len() - JOURNAL_LIMIT;
@@ -334,6 +337,37 @@ mod tests {
         s.usage.insert("b".into(), usage_rec(1100, 10.0));
         s.record_switch(SurfaceKind::ClaudeCli, "b", 1400);
         assert_eq!(s.usage["b"].next_poll_at, 1100);
+    }
+
+    #[test]
+    fn record_switch_makes_an_expired_previous_account_due() {
+        let mut s = State::default();
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1);
+        s.usage.insert("a".into(), UsageRecord { state: UsageState::Expired, ..usage_rec(1660, 10.0) });
+        s.record_switch(SurfaceKind::ClaudeCli, "b", 1400);
+        assert_eq!(s.usage["a"].next_poll_at, 1400);
+        // An earlier schedule is never pushed back.
+        s.usage.insert("b".into(), UsageRecord { state: UsageState::Expired, ..usage_rec(1100, 10.0) });
+        s.record_switch(SurfaceKind::ClaudeCli, "c", 1500);
+        assert_eq!(s.usage["b"].next_poll_at, 1100);
+    }
+
+    #[test]
+    fn record_switch_keeps_the_schedule_of_a_previous_account_that_is_not_expired() {
+        let mut s = State::default();
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1);
+        s.usage.insert("a".into(), usage_rec(1660, 10.0));
+        s.record_switch(SurfaceKind::ClaudeCli, "b", 1400);
+        assert_eq!(s.usage["a"].next_poll_at, 1660);
+    }
+
+    #[test]
+    fn record_switch_keeps_the_schedule_of_an_expired_previous_account_after_a_recent_429() {
+        let mut s = State::default();
+        s.record_switch(SurfaceKind::ClaudeCli, "a", 1);
+        s.usage.insert("a".into(), UsageRecord { state: UsageState::Expired, last_429_at: Some(1300), ..usage_rec(1660, 10.0) });
+        s.record_switch(SurfaceKind::ClaudeCli, "b", 1400);
+        assert_eq!(s.usage["a"].next_poll_at, 1660);
     }
 
     #[test]

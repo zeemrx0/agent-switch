@@ -86,6 +86,16 @@ pub fn due_on_activation(rec: &mut UsageRecord, now: u64) {
     }
 }
 
+/// Called when a surface leaves an account: an expired reading never reached the endpoint, so the account is
+/// due now and the poll can refresh its saved copy. A recent 429 keeps its slower cadence; every other
+/// state keeps its schedule.
+pub fn due_on_release(rec: &mut UsageRecord, now: u64) {
+    if rec.state != UsageState::Expired || recent_429(Some(rec), now) {
+        return;
+    }
+    rec.next_poll_at = rec.next_poll_at.min(now);
+}
+
 /// `(next_poll_at, interval_s, urgent_streak)` after a successful reading.
 ///
 /// Movement halves the interval (never below 180 s); a still account backs off x1.5 toward its ceiling; the
