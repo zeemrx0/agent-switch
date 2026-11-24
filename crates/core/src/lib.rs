@@ -3,11 +3,14 @@
 
 pub mod adapters;
 pub mod apfs_clone;
+pub mod claude_statusline;
+pub mod codex_sessions;
 pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod fsutil;
 pub mod keychain;
+pub mod live_usage;
 pub mod locks;
 pub mod macos_apps;
 pub mod paths;

@@ -2,6 +2,7 @@
 //! storage formats, shallow-home drift, `cli_auth_credentials_store`, app versions).
 
 
+use crate::claude_statusline::{self, Inspection};
 use crate::config::{mask_email, Config, SurfaceKind};
 use crate::paths::Paths;
 use crate::state::State;
@@ -77,6 +78,7 @@ pub fn run(input: &DoctorInput) -> Vec<Check> {
         out.extend(quarantine_checks(state));
     }
     out.extend(symlink_checks(input.paths));
+    out.push(statusline_check(input.paths));
 
     out.push(check(Level::Skip, "claude storage", "not implemented yet (phase 2)"));
     out.push(check(Level::Skip, "codex storage", "not implemented yet (phase 3): auth.json format, cli_auth_credentials_store, shallow-home drift"));
@@ -134,6 +136,16 @@ fn symlink_checks(paths: &Paths) -> Vec<Check> {
             )
         })
         .collect()
+}
+
+/// Whether Claude Code's status line feeds live quota readings (`agent-switch statusline install`).
+fn statusline_check(paths: &Paths) -> Check {
+    match claude_statusline::inspect(paths) {
+        Ok(Inspection::Installed) => check(Level::Ok, "statusline", "wrapper installed: Claude Code reports its quota live"),
+        Ok(Inspection::NotInstalled) => check(Level::Ok, "statusline", "wrapper not installed: Claude quota comes from polling only (`agent-switch statusline install` adds live readings)"),
+        Ok(Inspection::Broken(why)) => check(Level::Warn, "statusline", why),
+        Err(e) => check(Level::Warn, "statusline", e.to_string()),
+    }
 }
 
 fn consistency_checks(config: &Config, state: &State) -> Vec<Check> {
@@ -207,6 +219,27 @@ mod tests {
         assert!(link.detail.contains(".claude.json") && link.detail.contains("will not replace"), "{}", link.detail);
         let q = checks.iter().find(|c| c.name == "quarantine").expect("a quarantine check");
         assert!(q.detail.contains("quarantine-abcd") && q.detail.contains("remove quarantine-abcd"), "{}", q.detail);
+    }
+
+    #[test]
+    fn the_statusline_wrapper_is_reported_as_installed_missing_or_broken() {
+        let (d, paths, vault) = setup();
+        let find = |paths: &Paths| run(&DoctorInput { paths, vault: &vault }).into_iter().find(|c| c.name == "statusline").unwrap();
+        let c = find(&paths);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.detail.contains("not installed"), "{}", c.detail);
+
+        let bin = d.path().join("agent-switch");
+        std::fs::write(&bin, "").unwrap();
+        claude_statusline::install(&paths, &bin).unwrap();
+        let c = find(&paths);
+        assert_eq!((c.level, c.detail.contains("installed")), (Level::Ok, true), "{}", c.detail);
+        assert!(!c.detail.contains("not installed"));
+
+        std::fs::remove_file(&bin).unwrap();
+        let c = find(&paths);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("does not exist"), "{}", c.detail);
     }
 
     #[test]

@@ -70,4 +70,19 @@ impl Paths {
     pub fn watcher_lock_file(&self) -> PathBuf {
         self.locks_dir().join("watcher.lock")
     }
+
+    /// `~/.claude/settings.json`, where Claude Code keeps its `statusLine`.
+    pub fn claude_settings_file(&self) -> PathBuf {
+        self.home.join(".claude/settings.json")
+    }
+
+    /// The `statusLine` that was in `~/.claude/settings.json` before `statusline install` wrapped it.
+    pub fn statusline_saved_file(&self) -> PathBuf {
+        self.support_dir().join("claude-statusline.json")
+    }
+
+    /// `~/.codex/sessions`: one rollout file per Codex session. The shallow Codex home links to it.
+    pub fn codex_sessions_dir(&self) -> PathBuf {
+        self.home.join(".codex/sessions")
+    }
 }

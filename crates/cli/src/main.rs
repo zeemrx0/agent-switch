@@ -5,6 +5,7 @@ mod commands;
 mod desktop_commands;
 mod list_command;
 mod registry;
+mod statusline_command;
 
 use clap::{Parser, Subcommand};
 
@@ -100,10 +101,28 @@ enum Command {
     ShellInit,
     /// Check config, state, keychain backend and saved logins
     Doctor,
+    /// Claude Code's status line command (reads its JSON on stdin, takes the quota reading, then runs your
+    /// original status line). `install` and `uninstall` wrap and unwrap it in ~/.claude/settings.json
+    Statusline {
+        #[command(subcommand)]
+        action: Option<StatuslineAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StatuslineAction {
+    /// Make Claude Code report its quota live: backs settings.json up, saves your status line, wraps it
+    Install,
+    /// Put your original status line back
+    Uninstall,
 }
 
 fn main() {
     let cli = Cli::parse();
+    // The status line command prints and fails only as the user's own command does.
+    if let Command::Statusline { action: None } = cli.command {
+        std::process::exit(statusline_command::wrapper());
+    }
     let result = match cli.command {
         Command::Status => commands::status(),
         Command::List { json } => list_command::list(json),
@@ -119,6 +138,9 @@ fn main() {
         Command::DesktopSessions { action, dry_run } => desktop_commands::desktop_sessions(&action, dry_run),
         Command::ShellInit => codex_commands::shell_init(),
         Command::Doctor => commands::doctor(),
+        Command::Statusline { action: Some(StatuslineAction::Install) } => statusline_command::install(),
+        Command::Statusline { action: Some(StatuslineAction::Uninstall) } => statusline_command::uninstall(),
+        Command::Statusline { action: None } => unreachable!("handled before the match"),
     };
     match result {
         Ok(code) => std::process::exit(code),

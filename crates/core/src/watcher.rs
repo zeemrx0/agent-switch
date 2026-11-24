@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codex_sessions::CodexSessions;
 use crate::config::{Account, Config, Provider, SurfaceKind};
 use crate::error::{Error, Result};
 use crate::fsutil::ensure_private_dir;
@@ -34,7 +35,9 @@ pub const EVENT_TTL_S: u64 = 15 * 60;
 const LOG_ROTATE_BYTES: u64 = 1 << 20;
 /// The same "no candidate" notice is not repeated more often than this.
 const NO_CANDIDATE_REPEAT_S: u64 = 30 * 60;
-const MAX_SLEEP_S: u64 = 60;
+/// Short enough that a Codex session log is read within about 15 seconds of its newest line. Polling keeps its
+/// own cadence (`next_poll_at`), so a shorter sleep adds no request.
+const MAX_SLEEP_S: u64 = 15;
 const MIN_SLEEP_S: u64 = 5;
 /// Wait after the 1st, 2nd, 3rd and later failed switch to the same target while the live login is the same:
 /// 1 minute, 5 minutes, 30 minutes, then 6 hours.
@@ -175,6 +178,7 @@ pub struct Watcher<'a> {
     paused: Vec<Provider>,
     last_no_candidate: Vec<(SurfaceKind, u64)>,
     failures: Vec<Failure>,
+    codex_sessions: CodexSessions,
     sink: Option<EventSink<'a>>,
 }
 
@@ -197,7 +201,7 @@ impl<'a> Watcher<'a> {
 
     /// A watcher without the singleton lock, for callers that already hold it and for tests.
     pub fn new(env: &'a Env<'a>, api: &'a dyn ProviderApi, surfaces: SurfaceFactory<'a>) -> Watcher<'a> {
-        Watcher { env, api, surfaces, log: EventLog::new(env.paths), _lock: None, paused: Vec::new(), last_no_candidate: Vec::new(), failures: Vec::new(), sink: None }
+        Watcher { env, api, surfaces, log: EventLog::new(env.paths), _lock: None, paused: Vec::new(), last_no_candidate: Vec::new(), failures: Vec::new(), codex_sessions: CodexSessions::new(), sink: None }
     }
 
     /// Also hand every event to `sink` after it is logged (the menu bar turns them into notifications).
@@ -223,7 +227,7 @@ impl<'a> Watcher<'a> {
         token_refresh::Ctx { env: self.env, api: self.api }
     }
 
-    /// Repeat `tick` until `stop` is set. Sleeps until the next account is due, at most a minute at a time.
+    /// Repeat `tick` until `stop` is set. Sleeps until the next account is due, at most `MAX_SLEEP_S` at a time.
     pub fn run(&mut self, stop: &AtomicBool) {
         while !stop.load(Ordering::Relaxed) {
             let now = now_secs();
@@ -240,7 +244,7 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// Seconds to wait before the next pass: until the next account is due, between 5 and 60.
+    /// Seconds to wait before the next pass: until the next account is due, between 5 and 15.
     pub fn wait_secs(&self, now: u64) -> u64 {
         let due = match (Config::load(self.env.paths), State::load(self.env.paths)) {
             (Ok(c), Ok(s)) => policy::next_due(&c, &s, now),
@@ -252,6 +256,10 @@ impl<'a> Watcher<'a> {
     /// One pass at time `now`.
     pub fn tick(&mut self, now: u64) -> Result<()> {
         let config = Config::load(self.env.paths)?;
+        // Before polling: a fresh live reading moves an account's next poll out.
+        if let Err(e) = self.codex_sessions.ingest(self.env.paths, &config, now) {
+            eprintln!("agent-switch: cannot read the Codex session logs: {e}");
+        }
         self.poll_due(&config, now);
         self.drop_expired_events(now)?;
         if !config.auto.any_enabled() {
@@ -1196,6 +1204,34 @@ mod tests {
             w.tick(T0 + 2000).unwrap();
         });
         assert!(r.kinds().contains(&EventKind::AutoResumed));
+    }
+
+    #[test]
+    fn a_codex_session_log_updates_the_account_and_spares_the_poller_a_request() {
+        let mut r = Rig::new(&[("x", Provider::Openai, OK)]);
+        r.auto(|c| c.accounts[0].uuid = Some("acct-x".into()));
+        let day = r.f.paths.codex_sessions_dir().join("2027/01/15");
+        std::fs::create_dir_all(&day).unwrap();
+        let meta = r#"{"timestamp":"2027-01-15T07:59:50Z","type":"session_meta","payload":{"creator_account_id":"acct-x"}}"#;
+        let event = r#"{"timestamp":"2027-01-15T08:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":42.0,"window_minutes":300,"resets_at":1800003600},"secondary":{"used_percent":8.0,"window_minutes":10080,"resets_at":1800400000}}}}"#;
+        std::fs::write(day.join("rollout-1.jsonl"), format!("{meta}\n{event}\n")).unwrap();
+        // No usage reply is scripted: a request to the endpoint would panic the fake.
+        r.run(|w| w.tick(T0 + 10).unwrap());
+        let rec = State::load(&r.f.paths).unwrap().usage["x"].clone();
+        assert_eq!((rec.state, rec.fetched_at, rec.windows.five_hour.map(|s| s.pct)), (UsageState::Ok, Some(T0), Some(42.0)));
+        assert_eq!(r.f.api.count("usage:"), 0);
+        assert!(rec.next_poll_at >= T0 + policy::MIN_INTERVAL_S);
+    }
+
+    #[test]
+    fn the_watcher_wakes_at_least_every_fifteen_seconds() {
+        let r = Rig::new(&[("x", Provider::Openai, OK)]);
+        State::update(&r.f.paths, |s| {
+            s.usage.insert("x".into(), crate::state::UsageRecord { next_poll_at: now_secs() + 3600, ..Default::default() });
+        })
+        .unwrap();
+        assert_eq!(r.run(|w| w.wait_secs(now_secs())), MAX_SLEEP_S);
+        assert_eq!(MAX_SLEEP_S, 15);
     }
 
     #[test]

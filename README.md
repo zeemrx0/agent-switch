@@ -169,6 +169,22 @@ claude-cli = ["team-claude", "personal-claude"]
 - `codex_cli_mode`: `new-sessions` switches the login now and running Codex sessions keep the old account until restarted; `notify` never switches automatically and offers a button; `force` switches now even if a running session then hits a sign-in error.
 - Accounts that are exhausted or have a dead login are skipped. By default a saved login is refreshed only just before you switch to it.
 
+### Live quota readings
+
+Usage is polled from the providers' endpoints, at most one request per account every 3 minutes or so. Two sources give the account that a CLI is using a fresher number without any request:
+
+- **Codex** needs no setup. The menu bar app reads the newest quota line in `~/.codex/sessions` (written by the Codex CLI and the ChatGPT app) about every 15 seconds and credits it to the saved account with the same ChatGPT account id.
+- **Claude Code** needs one command. Claude Code hands its quota to the status line command after each reply, so agent-switch wraps that command:
+
+```sh
+agent-switch statusline install         # report Claude Code's quota to agent-switch
+agent-switch statusline uninstall       # put your original status line back
+```
+
+`install` copies `~/.claude/settings.json` to `~/Library/Application Support/agent-switch/backups/claude-settings-<time>`, saves your current `statusLine` in `~/Library/Application Support/agent-switch/claude-statusline.json`, and sets `statusLine.command` to `<path to agent-switch> statusline`. Every other setting stays as it was. On each refresh the wrapper records the quota for the account active on `claude-cli` (skipped for a minute after a switch, and when `claude-cli` is unmanaged), then runs your original command with the same input, so the status line looks the same. It prints nothing of its own, uses no network and no Keychain, and exits with your command's exit code. A second `install` changes nothing. Run it from the binary you want Claude Code to use: if you move or upgrade agent-switch to another path, run `install` again, and `doctor` warns when the path no longer exists.
+
+Accounts that no CLI is using are still polled as before.
+
 ### Repair and Dock launches
 
 ```sh
