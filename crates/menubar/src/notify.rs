@@ -7,6 +7,9 @@
 
 use agent_switch_core::config::{CodexCliMode, Config, SurfaceKind};
 use agent_switch_core::watcher::{Event, EventKind};
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
+
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
@@ -164,7 +167,13 @@ pub struct Notifier {
     center: Retained<UNUserNotificationCenter>,
     // The center keeps only a weak reference to its delegate.
     _delegate: Retained<Delegate>,
+    /// The authorization status the system last reported; `STATUS_UNKNOWN` until it answers.
+    status: Arc<AtomicIsize>,
 }
+
+const STATUS_UNKNOWN: isize = -1;
+/// `UNAuthorizationStatus` values that let a notification show: allowed, provisional and ephemeral.
+const STATUS_SHOWN: [isize; 3] = [2, 3, 4];
 
 fn ns(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
@@ -189,6 +198,21 @@ fn describe(error: *mut NSError) -> String {
     }
 }
 
+/// Ask the system for the authorization status and store it in `status` when it answers. `log` also writes
+/// it to the log.
+fn query_status(center: &UNUserNotificationCenter, status: &Arc<AtomicIsize>, log: bool) {
+    let seen = Arc::clone(status);
+    let settings = RcBlock::new(move |s: std::ptr::NonNull<UNNotificationSettings>| {
+        // SAFETY: the system passes a valid settings object for the duration of the callback.
+        let value = unsafe { s.as_ref() }.authorizationStatus().0;
+        seen.store(value, Ordering::Relaxed);
+        if log {
+            crate::log_line(&format!("notification authorization status: {value} (0 undecided, 1 denied, 2 allowed, 3 provisional)"));
+        }
+    });
+    center.getNotificationSettingsWithCompletionHandler(&settings);
+}
+
 impl Notifier {
     /// Set up the center, register the buttons and ask for permission. `on_response` runs on a system
     /// thread when a button is pressed.
@@ -201,18 +225,24 @@ impl Notifier {
         center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         center.setNotificationCategories(&NSSet::from_retained_slice(&[category(CATEGORY_DESKTOP, "Relaunch now"), category(CATEGORY_CLI, "Switch now")]));
 
-        let granted = RcBlock::new(|granted: Bool, error: *mut NSError| {
+        let status = Arc::new(AtomicIsize::new(STATUS_UNKNOWN));
+        // The answer to the permission prompt changes the status, so read it again then.
+        let after_answer = Arc::clone(&status);
+        let granted = RcBlock::new(move |granted: Bool, error: *mut NSError| {
             crate::log_line(&format!("notification permission: granted={} ({})", granted.as_bool(), describe(error)));
+            query_status(&UNUserNotificationCenter::currentNotificationCenter(), &after_answer, true);
         });
         center.requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &granted);
+        query_status(&center, &status, true);
+        Ok(Notifier { center, _delegate: delegate, status })
+    }
 
-        let settings = RcBlock::new(|s: std::ptr::NonNull<UNNotificationSettings>| {
-            // SAFETY: the system passes a valid settings object for the duration of the callback.
-            let status = unsafe { s.as_ref() }.authorizationStatus().0;
-            crate::log_line(&format!("notification authorization status: {status} (0 undecided, 1 denied, 2 allowed, 3 provisional)"));
-        });
-        center.getNotificationSettingsWithCompletionHandler(&settings);
-        Ok(Notifier { center, _delegate: delegate })
+    /// Whether a notification reaches the user. False when the user denied them, has not answered yet, or
+    /// the system has not reported yet. The answer comes from the last report; this call asks the system again
+    /// without waiting, so a change in System Settings shows from the next call on.
+    pub fn shows_notifications(&self) -> bool {
+        query_status(&self.center, &self.status, false);
+        STATUS_SHOWN.contains(&self.status.load(Ordering::Relaxed))
     }
 
     pub fn post(&self, note: &Note) {

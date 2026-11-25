@@ -4,7 +4,7 @@
 //! Account labels and server-side names are shown as plain text. A `muda` title treats `&` as a mnemonic
 //! marker, so `escape_title` doubles it; nothing here is ever passed to a shell or to AppleScript.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agent_switch_core::config::{Account, Binding, CodexCliMode, Config, Provider, SurfaceKind};
 use agent_switch_core::policy;
@@ -42,6 +42,9 @@ pub enum Action {
     OpenClaude,
     /// Open Terminal on the `agent-switch add` command of a provider, to sign in a new account.
     AddAccount(Provider),
+    /// Open Terminal on `agent-switch add claude-desktop <account>`, to register the Claude Desktop profile
+    /// that "Use for Desktop" needs.
+    SetUpDesktop(String),
     /// Open Terminal on the `agent-switch add` command that saves the login the provider's own app holds.
     SaveCurrentLogin(Provider),
     /// Remove an account from agent-switch, like `agent-switch remove`: its saved login leaves the vault and
@@ -225,6 +228,8 @@ pub struct Ctx {
     pub watcher_running: bool,
     /// A refused busy switch that the user may force; ignored once it is older than `FORCE_OFFER_SECS`.
     pub force_offer: Option<ForceOffer>,
+    /// Accounts that have a registered Claude Desktop profile. Without one, "Use for Desktop" cannot work.
+    pub desktop_profiles: HashSet<String>,
 }
 
 /// Whether the tray menu must be rebuilt. A click forces it: the native check item flips by itself when
@@ -297,7 +302,7 @@ fn surfaces(provider: Provider) -> (SurfaceKind, Option<SurfaceKind>) {
 
 /// The row of `account`, with its submenu. `cli` and `app` are the provider's surfaces, and `cli_current` and
 /// `app_current` their current accounts.
-fn account_entry(state: &State, account: &Account, surfaces: (SurfaceKind, Option<SurfaceKind>), currents: (Option<&str>, Option<&str>), threshold: u8, now: u64) -> Entry {
+fn account_entry(state: &State, account: &Account, surfaces: (SurfaceKind, Option<SurfaceKind>), currents: (Option<&str>, Option<&str>), threshold: u8, now: u64, desktop_profiles: &HashSet<String>) -> Entry {
     let id = account.id.as_str();
     let (cli, app) = surfaces;
     let (cli_current, app_current) = currents;
@@ -306,8 +311,13 @@ fn account_entry(state: &State, account: &Account, surfaces: (SurfaceKind, Optio
     let mut children = vec![Entry::choice("Use for CLI", cli_current == Some(id), Action::Bind(cli, Binding::Account(id.to_string())))];
     if let Some(app) = app {
         let on = app_current == Some(id);
+        if app == SurfaceKind::ClaudeDesktop && !desktop_profiles.contains(id) {
+            // The switch would fail for want of a profile, so offer the setup instead.
+            children.push(Entry::item("Set up for Desktop…", Action::SetUpDesktop(id.to_string())));
+        } else {
         // Clicking it quits and reopens the app, so the row says so unless the app already uses the account.
         children.push(Entry::choice(format!("Use for Desktop{}", if on { "" } else { RELAUNCH_SUFFIX }), on, Action::SwitchApp(app, id.to_string())));
+        }
     }
     children.push(Entry::Separator);
     children.extend(info_lines(rec, &usage, now));
@@ -508,7 +518,7 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
         let currents = (cli_current.as_deref(), app_current.as_deref());
         out.push(provider_entry(config, provider, currents));
         for account in accounts {
-            out.push(account_entry(state, account, (cli, app), currents, config.auto.threshold, ctx.now));
+            out.push(account_entry(state, account, (cli, app), currents, config.auto.threshold, ctx.now, &ctx.desktop_profiles));
         }
         out.extend(pending);
         out.push(Entry::Separator);
@@ -678,7 +688,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, force_offer: None }
+        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, force_offer: None, desktop_profiles: ["personal".to_string(), "team".to_string()].into() }
     }
 
     fn find_row<'a>(entries: &'a [Entry], name: &str) -> &'a AccountRow {
@@ -727,6 +737,19 @@ mod tests {
         let menu = build(&c, &State::default(), &ctx());
         // 3 providers + 5 accounts + 3 separators + Add account + Settings + Version + Quit.
         assert_eq!(menu.len(), 15, "{}", to_text(&menu));
+    }
+
+    #[test]
+    fn a_claude_account_without_a_desktop_profile_offers_the_setup_instead_of_a_switch() {
+        let c = config();
+        let menu = build(&c, &State::default(), &Ctx { desktop_profiles: ["team".to_string()].into(), ..ctx() });
+        let personal = &find_row(&menu, "Personal").children;
+        assert_eq!(personal[1], Entry::item("Set up for Desktop…", Action::SetUpDesktop("personal".into())));
+        let team = &find_row(&menu, "Team").children;
+        assert_eq!(team[1], Entry::Item { text: "Use for Desktop".into(), action: None, checked: Some(true), enabled: true }, "a profiled account keeps its switch");
+        let other = build(&c, &State::default(), &Ctx { desktop_profiles: HashSet::new(), ..ctx() });
+        let oa = &find_row(&other, "OpenAI Personal").children;
+        assert!(matches!(&oa[1], Entry::Item { action: Some(Action::SwitchApp(SurfaceKind::ChatgptDesktop, _)), .. }), "ChatGPT Desktop rows are unchanged: {oa:?}");
     }
 
     #[test]

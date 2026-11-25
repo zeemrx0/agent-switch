@@ -47,7 +47,8 @@ pub enum Report {
     Event(Event),
     /// Something the user should read: the result of a click, or why it did nothing. `dialog` also shows it in
     /// a dialog, for a click the user confirmed in one.
-    Notice { title: String, body: String, dialog: bool },
+    /// `failure` marks an action that did not finish; the app shows it in a dialog when notifications are off.
+    Notice { title: String, body: String, dialog: bool, failure: bool },
     /// A Desktop switch was refused because these sessions are mid-reply; the menu offers "Switch anyway".
     Busy { kind: SurfaceKind, account: Option<String>, titles: String },
     /// Config or state may have changed.
@@ -173,7 +174,7 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
             for why in skipped {
                 crate::log_line(&why);
             }
-            report(Report::Notice { title: "agent-switch".into(), body, dialog: false });
+            report(Report::Notice { title: "agent-switch".into(), body, dialog: false, failure: false });
             report(Report::Changed);
         }
     }
@@ -199,7 +200,7 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
                 let confirmed = matches!(action, Action::LogOut(_));
                 let outcome = catch_unwind(AssertUnwindSafe(|| job.handle(action)));
                 match outcome {
-                    Ok(Ok(Some(body))) => report(Report::Notice { title: "agent-switch".into(), body, dialog: confirmed }),
+                    Ok(Ok(Some(body))) => report(Report::Notice { title: "agent-switch".into(), body, dialog: confirmed, failure: false }),
                     Ok(Ok(None)) => {}
                     Ok(Err(e)) => {
                         let text = e.to_string();
@@ -208,7 +209,7 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
                         }
                         // A log out's text starts with its own verdict, so it needs no title in front of it.
                         let title = if confirmed { "agent-switch" } else { "agent-switch could not finish" };
-                        report(Report::Notice { title: title.into(), body: text, dialog: confirmed });
+                        report(Report::Notice { title: title.into(), body: text, dialog: confirmed, failure: true });
                     }
                     Err(_) => break "an action panicked".to_string(),
                 }
@@ -391,6 +392,10 @@ impl Job<'_> {
             Action::AddAccount(provider) => {
                 add_account::open_terminal(paths, provider, Flow::New)?;
                 Ok(Some(format!("Opened Terminal to add a {} account.", provider_title(provider))))
+            }
+            Action::SetUpDesktop(id) => {
+                add_account::open_desktop_setup(paths, &id)?;
+                Ok(Some(format!("Opened Terminal to set up Claude Desktop for {}.", label_of(&Config::load(paths)?, &id))))
             }
             Action::SaveCurrentLogin(provider) => {
                 add_account::open_terminal(paths, provider, Flow::Current)?;

@@ -93,10 +93,23 @@ fn main() {
 
 /// The menu for what is on disk now.
 fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceOffer>) -> Vec<Entry> {
-    let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer };
     match (Config::load(paths), State::load(paths)) {
-        (Ok(config), Ok(state)) => menu::build(&config, &state, &ctx),
-        (Err(e), _) | (_, Err(e)) => menu::error_menu(&e.to_string(), &ctx),
+        (Ok(config), Ok(state)) => {
+            let desktop_profiles = match claude_desktop::Registry::load(paths) {
+                Ok(registry) => registry.profiles.into_keys().collect(),
+                Err(e) => {
+                    // Unreadable, so keep the plain "Use for Desktop" rows; that action reports the problem.
+                    log_line(&format!("cannot read the Claude Desktop profiles: {e}"));
+                    config.accounts.iter().map(|a| a.id.clone()).collect()
+                }
+            };
+            let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer, desktop_profiles };
+            menu::build(&config, &state, &ctx)
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer, desktop_profiles: Default::default() };
+            menu::error_menu(&e.to_string(), &ctx)
+        }
     }
 }
 
@@ -210,7 +223,7 @@ struct App {
     /// The latest action result, kept in the menu because notifications may be denied.
     /// The result of a confirmed Log out, waiting for the tray menu to close before its dialog opens. A newer
     /// result replaces an older one.
-    pending_result: Option<String>,
+    pending_result: Option<(String, String)>,
     /// A refused busy switch the menu can force; the menu drops it after `menu::FORCE_OFFER_SECS`.
     force_offer: Option<ForceOffer>,
     watcher_running: bool,
@@ -239,8 +252,8 @@ impl App {
         if menu_is_open() {
             return;
         }
-        if let Some(body) = self.pending_result.take() {
-            confirm::inform("Log out", &body);
+        if let Some((title, body)) = self.pending_result.take() {
+            confirm::inform(&title, &body);
         }
     }
 
@@ -319,10 +332,14 @@ impl App {
                 }
                 Err(e) => log_line(&format!("cannot read the config for a notification: {e}")),
             },
-            Report::Notice { title, body, dialog } => {
+            Report::Notice { title, body, dialog, failure } => {
                 self.notice(&title, &body);
+                // Notifications may be denied, and a failure the user never sees looks like a dead click.
                 if dialog {
-                    self.pending_result = Some(body);
+                    self.pending_result = Some(("Log out".into(), body));
+                    self.show_pending_result();
+                } else if failure && !self.notifications_shown() {
+                    self.pending_result = Some((title, body));
                     self.show_pending_result();
                 }
             }
@@ -361,6 +378,10 @@ impl App {
         if let Some(n) = &self.notifier {
             n.post(&Note::info(format!("{}-{}", now_secs(), self.counter), title, body));
         }
+    }
+
+    fn notifications_shown(&self) -> bool {
+        self.notifier.as_ref().is_some_and(Notifier::shows_notifications)
     }
 
     fn post(&self, note: &Note) {

@@ -17,6 +17,12 @@ use agent_switch_core::{Error, Result};
 /// Where `scripts/install.sh` puts the CLI, relative to `$HOME`.
 const INSTALLED_CLI: &str = ".local/bin/agent-switch";
 
+/// The start of the file name of a Claude Desktop setup script.
+const SETUP_PREFIX: &str = "setup-claude-desktop-";
+
+/// How long a setup script stays before the next setup removes it.
+const SETUP_KEEP: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// What the script saves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -76,6 +82,12 @@ fn shell_quote(text: &str) -> String {
 /// that `install.sh` put in `~/.local/bin`, else the one on the login shell's `PATH`. It says whether the
 /// `add` saved an account, and waits for Enter at the end so the output can be read.
 fn script_with(provider: Provider, flow: Flow, bundled: Option<&Path>) -> String {
+    wrap(provider_lines(provider, flow), bundled, "Account saved. The menu updates within a few seconds. You can close this window.", "No account was saved. Read the message above, then close this window.")
+}
+
+/// `body` in the script frame: it finds the CLI, runs `body` with `$bin` set, then prints `saved` or `failed`
+/// by the exit status of `body`'s last command, and waits for Enter.
+fn wrap(body: &str, bundled: Option<&Path>, saved: &str, failed: &str) -> String {
     let bundled = bundled.map(|p| shell_quote(&p.to_string_lossy())).unwrap_or_else(|| "''".to_string());
     format!(
         "#!/bin/zsh -l\n\
@@ -85,11 +97,17 @@ fn script_with(provider: Provider, flow: Flow, bundled: Option<&Path>) -> String
          rc=1\n\
          if [ -z \"$bin\" ]; then\n  echo \"agent-switch was not found. Install agent-switch with Homebrew: brew install zeemrx0/tap/agent-switch\"\nelse\n{body}rc=$?\nfi\n\
          echo\n\
-         if [ \"$rc\" -eq 0 ]; then\n  echo \"Account saved. The menu updates within a few seconds. You can close this window.\"\n\
-         else\n  echo \"No account was saved. Read the message above, then close this window.\"\nfi\n\
-         read -r reply\n",
-        body = provider_lines(provider, flow)
+         if [ \"$rc\" -eq 0 ]; then\n  echo \"{saved}\"\n\
+         else\n  echo \"{failed}\"\nfi\n\
+         read -r reply\n"
     )
+}
+
+/// The text of the script that registers the Claude Desktop profile of `account`. The id is passed as one
+/// quoted word, so it never becomes shell syntax.
+fn desktop_script_with(account: &str, bundled: Option<&Path>) -> String {
+    let body = format!("echo \"Setting up Claude Desktop for this account. Sign in if Claude asks.\"\n\"$bin\" add claude-desktop {}\n", shell_quote(account));
+    wrap(&body, bundled, "Claude Desktop is set up. The menu updates within a few seconds. You can close this window.", "Claude Desktop was not set up. Read the message above, then close this window.")
 }
 
 /// The script of `provider` and `flow` for this running app.
@@ -97,21 +115,51 @@ pub fn script(provider: Provider, flow: Flow) -> String {
     script_with(provider, flow, bundled_cli().as_deref())
 }
 
-/// Write the script of `provider` and `flow` into the app's private `tmp` folder, executable by the user only.
-fn write_script(paths: &Paths, provider: Provider, flow: Flow) -> Result<PathBuf> {
+/// Write a script into the app's private `tmp` folder, executable by the user only.
+fn write_private(paths: &Paths, name: &str, text: &str) -> Result<PathBuf> {
     let dir = paths.support_dir().join("tmp");
     ensure_private_dir(&dir)?;
-    let path = dir.join(script_name(provider, flow));
-    safe_write(&path, script(provider, flow).as_bytes(), &WriteOpts::secret().with_mode(0o700))?;
+    let path = dir.join(name);
+    safe_write(&path, text.as_bytes(), &WriteOpts::secret().with_mode(0o700))?;
     Ok(path)
+}
+
+/// Write the script of `provider` and `flow` into the app's private `tmp` folder.
+fn write_script(paths: &Paths, provider: Provider, flow: Flow) -> Result<PathBuf> {
+    write_private(paths, script_name(provider, flow), &script(provider, flow))
 }
 
 /// Open Terminal on the add-account script of `provider`.
 pub fn open_terminal(paths: &Paths, provider: Provider, flow: Flow) -> Result<()> {
-    let path = write_script(paths, provider, flow)?;
+    open_script(&write_script(paths, provider, flow)?)
+}
+
+/// Open Terminal on the script that sets up Claude Desktop for `account`. Each call writes a new file, so a
+/// second click cannot replace a script that Terminal has not read yet. The account id reaches the script
+/// only as a quoted word, never in a path. Setup scripts older than `SETUP_KEEP` are removed first.
+pub fn open_desktop_setup(paths: &Paths, account: &str) -> Result<()> {
+    let dir = paths.support_dir().join("tmp");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // A script that is minutes old has been read by Terminal; a newer one may still be waiting.
+            let old = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > SETUP_KEEP);
+            if name.starts_with(SETUP_PREFIX) && name.ends_with(".command") && old {
+                // Best effort: a script that is already gone is not a failure of this setup.
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let name = format!("{SETUP_PREFIX}{}-{nanos}.command", std::process::id());
+    open_script(&write_private(paths, &name, &desktop_script_with(account, bundled_cli().as_deref()))?)
+}
+
+fn open_script(path: &Path) -> Result<()> {
     let status = Command::new("/usr/bin/open")
         .args(["-a", "Terminal"])
-        .arg(&path)
+        .arg(path)
         .status()
         .map_err(|e| Error::io("run /usr/bin/open", e))?;
     if status.success() {
@@ -228,6 +276,37 @@ mod tests {
         assert!(given.contains("antigravity-cli --id work") && given.contains("Account saved."), "{given}");
         let none = run_with_fake_cli(Provider::Antigravity, Flow::New, 0, "\n\n");
         assert!(none.contains("No id given.") && none.contains("No account was saved.") && !none.contains("fake add"), "{none}");
+    }
+
+    #[test]
+    fn the_desktop_setup_script_passes_the_account_id_quoted() {
+        let s = desktop_script_with("claude-zee", Some(Path::new("/Apps/agent-switch")));
+        assert!(s.contains("\"$bin\" add claude-desktop 'claude-zee'\nrc=$?\nfi\n"), "{s}");
+        assert!(s.contains("Claude Desktop is set up.") && s.contains("Claude Desktop was not set up."), "{s}");
+        assert!(s.starts_with("#!/bin/zsh -l\n") && s.trim_end().ends_with("read -r reply"), "{s}");
+        let tricky = desktop_script_with("it's", None);
+        assert!(tricky.contains("add claude-desktop 'it'\\''s'\n"), "{tricky}");
+    }
+
+    #[test]
+    fn the_desktop_setup_script_runs_the_add_and_reports_its_status() {
+        use std::io::Write;
+        use std::process::Stdio;
+        for code in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let cli = dir.path().join("agent-switch");
+            std::fs::write(&cli, format!("#!/bin/sh\necho \"fake add $*\"\nexit {code}\n")).unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let file = dir.path().join("run.command");
+            std::fs::write(&file, desktop_script_with("it's me", Some(&cli))).unwrap();
+            let mut child = Command::new("/bin/zsh").arg(&file).env("HOME", dir.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(b"\n").unwrap();
+            let out = child.wait_with_output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains("fake add add claude-desktop it's me"), "{text}");
+            assert_eq!(text.contains("Claude Desktop is set up."), code == 0, "{text}");
+            assert_eq!(text.contains("Claude Desktop was not set up."), code != 0, "{text}");
+        }
     }
 
     #[test]
