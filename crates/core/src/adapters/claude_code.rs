@@ -63,6 +63,77 @@ const LIVE_WRITE_ATTEMPTS: u32 = 3;
 const ROTATED_KEYS: [&str; 4] = ["accessToken", "expiresAt", "refreshToken", "scopes"];
 const ENV_REFUSED: [&str; 3] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
 
+/// Prefix of the temporary profile folders that `add_interactive` creates, followed by `<pid>-<nanos hex>`.
+const ADD_PROFILE_PREFIX: &str = "claude-add-";
+/// How often `add_interactive` looks for the new login while `claude` runs.
+const ADD_POLL: Duration = Duration::from_millis(500);
+
+/// Print a line to stdout. A closed terminal makes the write fail, and that must not panic or stop a save.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// The pid in a temporary profile folder name, if `name` is one.
+fn add_profile_pid(name: &str) -> Option<i32> {
+    let (pid, nanos) = name.strip_prefix(ADD_PROFILE_PREFIX)?.split_once('-')?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) || nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    pid.parse::<i32>().ok().filter(|p| *p > 0)
+}
+
+/// True when a process with this pid exists (`kill(pid, 0)`; EPERM means it exists but is not ours).
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists; nothing is delivered.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
+/// The `oauthAccount` object of a `.claude.json`, if the file has one.
+fn read_oauth_account(config_json: &Path) -> Option<Value> {
+    let obj: Obj = serde_json::from_str(&std::fs::read_to_string(config_json).ok()?).ok()?;
+    obj.get("oauthAccount").filter(|v| v.is_object()).cloned()
+}
+
+/// `ze***@domain (plan max)` for a saved account, without the full address.
+fn describe(done: &Imported) -> String {
+    let who = done.email.as_deref().map(crate::config::mask_email).unwrap_or_else(|| "an account with an unknown email".into());
+    match &done.plan {
+        Some(plan) => format!("{who} (plan {plan})"),
+        None => who,
+    }
+}
+
+extern "C" fn ignore_hangup(_: libc::c_int) {}
+
+/// Keeps this process alive when its terminal window closes. A handler is installed instead of `SIG_IGN`
+/// because a handled signal is reset to its default in a child after `exec`, so `claude` still ends on hangup.
+/// One guard at a time: the disposition is process-wide, so overlapping guards would restore each other's state.
+struct HangupGuard(libc::sighandler_t, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+static HANGUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl HangupGuard {
+    fn install() -> HangupGuard {
+        HangupGuard::install_holding(HANGUP_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    fn install_holding(lock: std::sync::MutexGuard<'static, ()>) -> HangupGuard {
+        // SAFETY: the handler does nothing, so it is async-signal-safe.
+        let previous = unsafe { libc::signal(libc::SIGHUP, ignore_hangup as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+        HangupGuard(previous, lock)
+    }
+}
+
+impl Drop for HangupGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the disposition that `install` replaced.
+        unsafe { libc::signal(libc::SIGHUP, self.0) };
+    }
+}
+
 type Obj = Map<String, Value>;
 type EnvFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 type WriteFn = Arc<dyn Fn(&Path, &[u8]) -> Result<()> + Send + Sync>;
@@ -842,45 +913,102 @@ impl ClaudeCode {
         Ok(result)
     }
 
-    /// Log in a new account without logging out: run `claude` in a fresh `CLAUDE_CONFIG_DIR`, then save
-    /// the login it creates and delete the temporary folder and its Keychain item.
+    /// Log in a new account without logging out: run `claude` in a fresh `CLAUDE_CONFIG_DIR` and save the
+    /// login it creates as soon as it exists, then delete the temporary folder and its Keychain item.
+    ///
+    /// While `claude` runs, the profile's Keychain item is polled. The account is saved the moment the login
+    /// is complete, and `claude` is left running until the user exits it: ending it would cut off whatever it
+    /// is still writing, and the saved copy is already safe. If the window is closed instead of typing
+    /// `/exit`, SIGHUP kills `claude` but not this process, which then saves the login if that has not
+    /// happened yet and cleans up. Folders that an earlier run left behind (for example after a SIGKILL) are
+    /// recovered and removed after this add.
     pub fn add_interactive(&self, env: &Env, id: Option<&str>, label: Option<&str>) -> Result<Imported> {
         self.refuse_overrides()?;
         let setup = self.setup(env);
         let tmp_root = env.paths.support_dir().join("tmp");
         ensure_private_dir(&tmp_root)?;
+        let _hangup = HangupGuard::install();
+        let result = self.add_in_new_profile(env, &setup, &tmp_root, id, label);
+        // After the new add, so an explicit `--id` is taken before any recovered account can claim its login.
+        self.recover_stale_profiles(env, &setup, &tmp_root);
+        result
+    }
+
+    fn add_in_new_profile(&self, env: &Env, setup: &Setup, tmp_root: &Path, id: Option<&str>, label: Option<&str>) -> Result<Imported> {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-        let dir = tmp_root.join(format!("claude-add-{}-{nanos:x}", std::process::id()));
+        let dir = tmp_root.join(format!("{ADD_PROFILE_PREFIX}{}-{nanos:x}", std::process::id()));
         ensure_private_dir(&dir)?;
         let raw = dir.to_str().ok_or_else(|| Error::Invalid("the temporary folder path is not UTF-8".into()))?.to_string();
         let service = keychain_service_name(&raw);
+        let source = LoginSource { service: service.clone(), config_json: Some(dir.join(".claude.json")) };
 
         let result = (|| -> Result<Imported> {
-            println!("Claude Code will open with a fresh, empty profile. In it:");
-            println!("  1. type /login and finish the sign-in in your browser");
-            println!("  2. when it says you are logged in, type /exit");
-            println!("Your current Claude login is not touched, and you must not run /logout.");
-            let status = Command::new(&self.claude_bin)
+            say!("Claude Code will open with a fresh, empty profile. In it:");
+            say!("  1. type /login and finish the sign-in in your browser");
+            say!("  2. the account is saved as soon as you are signed in; then type /exit or close this window");
+            say!("Your current Claude login is not touched, and you must not run /logout.");
+            let mut child = Command::new(&self.claude_bin)
                 .env("CLAUDE_CONFIG_DIR", &raw)
                 .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR")
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("ANTHROPIC_AUTH_TOKEN")
                 .env_remove("ANTHROPIC_BASE_URL")
-                .status()
+                .spawn()
                 .map_err(|e| Error::io(format!("start `{}`", self.claude_bin.display()), e))?;
-            if !status.success() {
-                return Err(Error::Invalid(format!("claude exited with {status}; no login was saved")));
+
+            let mut saved: Option<Imported> = None;
+            // The Keychain text that was saved; `claude` may rotate the token in the profile afterwards.
+            let mut saved_text: Option<String> = None;
+            let mut retry_after_exit = false;
+            let status = loop {
+                if let Some(status) = child.try_wait().map_err(|e| Error::io("wait for claude", e))? {
+                    break status;
+                }
+                if saved.is_none() && !retry_after_exit && self.login_ready(&source, &setup.user) {
+                    match self.import_login(env, &source, id, label, false) {
+                        Ok(done) => {
+                            say!("Saved {}. You can type /exit or close this window.", describe(&done));
+                            saved_text = self.live.get(&service, &setup.user).ok().flatten();
+                            saved = Some(done);
+                        }
+                        Err(e) => {
+                            say!("The login could not be saved yet ({e}). Agent Switch tries again when Claude exits.");
+                            retry_after_exit = true;
+                        }
+                    }
+                }
+                std::thread::sleep(ADD_POLL);
+            };
+            if let Some(done) = saved {
+                // Claude may have refreshed the login after the save, and the saved refresh token is then dead.
+                match self.live.get(&service, &setup.user) {
+                    Ok(Some(now)) if saved_text.as_deref() != Some(now.as_str()) && parse_login(&now).is_ok() => {
+                        match self.import_login(env, &source, Some(&done.id), None, false) {
+                            Ok(_) => say!("Updated the saved login of `{}` with the one Claude refreshed.", done.id),
+                            Err(e) => say!("The saved login of `{}` may be out of date: {e}", done.id),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => say!("Could not check the login again before cleanup: {e}"),
+                }
+                return Ok(done);
             }
-            // The item can appear a moment after the process ends.
-            let deadline = Instant::now() + Duration::from_secs(10);
+
+            // The item can appear a moment after a clean exit. After any other exit it is there or it is not.
+            let deadline = Instant::now() + if status.success() { Duration::from_secs(10) } else { Duration::ZERO };
             while self.live.get(&service, &setup.user)?.is_none() {
                 if Instant::now() >= deadline {
-                    return Err(Error::NotFound("a login in the new profile (did /login finish?)".into()));
+                    return Err(if status.success() {
+                        Error::NotFound("a login in the new profile (did /login finish?)".into())
+                    } else {
+                        Error::Invalid(format!("claude exited with {status}; no login was saved"))
+                    });
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(ADD_POLL);
             }
-            let source = LoginSource { service: service.clone(), config_json: Some(dir.join(".claude.json")) };
-            self.import_login(env, &source, id, label, false)
+            let done = self.import_login(env, &source, id, label, false)?;
+            say!("Saved {}.", describe(&done));
+            Ok(done)
         })();
 
         // Cleanup runs on success and failure; only items and folders this call created are removed.
@@ -891,6 +1019,69 @@ impl ClaudeCode {
             (Ok(_), _, Err(e)) => Err(Error::io(format!("the account was saved, but removing {} failed", dir.display()), e)),
             _ => result,
         }
+    }
+
+    /// True once the new profile holds a complete login: a parseable Keychain item and the `oauthAccount`
+    /// that `/login` writes into the profile's `.claude.json`.
+    fn login_ready(&self, source: &LoginSource, user: &str) -> bool {
+        let Ok(Some(text)) = self.live.get(&source.service, user) else { return false };
+        parse_login(&text).is_ok() && source.config_json.as_deref().and_then(read_oauth_account).is_some()
+    }
+
+    /// Save and remove the profiles that earlier `add` runs left behind: folders `claude-add-<pid>-<id>`
+    /// whose process is gone. A login that is in such a profile and not yet saved is saved first. Only the
+    /// Keychain item that the folder's own path derives is deleted. A profile that cannot be saved stays for
+    /// the next run. Nothing here fails the new `add`; each outcome is printed.
+    fn recover_stale_profiles(&self, env: &Env, setup: &Setup, tmp_root: &Path) {
+        let Ok(entries) = std::fs::read_dir(tmp_root) else { return };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(pid) = file_name.to_str().and_then(add_profile_pid) else { continue };
+            // `file_type` does not follow links, so a link is never treated as a profile folder.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) || pid_alive(pid) {
+                continue;
+            }
+            let dir = entry.path();
+            let Some(raw) = dir.to_str() else { continue };
+            let service = keychain_service_name(raw);
+            match self.recover_login(env, setup, &dir, &service) {
+                Ok(Some(done)) => say!("Recovered the unfinished sign-in of {} as `{}`.", describe(&done), done.id),
+                Ok(None) => {}
+                Err(e) => {
+                    say!("Could not save the unfinished sign-in left in {}: {e}. It is kept for the next try.", dir.display());
+                    continue;
+                }
+            }
+            if let Err(e) = self.live.delete(&service, &setup.user) {
+                say!("Could not delete the leftover Keychain item `{service}`: {e}");
+            }
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                say!("Could not remove the leftover folder {}: {e}", dir.display());
+            }
+        }
+    }
+
+    /// Save the login of an abandoned profile unless its account is already saved (the saved copy is newer
+    /// or equal, and refresh tokens rotate, so it must not be overwritten). `None` when there is nothing to save.
+    fn recover_login(&self, env: &Env, setup: &Setup, dir: &Path, service: &str) -> Result<Option<Imported>> {
+        let Some(text) = self.live.get(service, &setup.user)? else { return Ok(None) };
+        if parse_login(&text).is_err() {
+            return Ok(None);
+        }
+        let config_json = dir.join(".claude.json");
+        if let Some(uuid) = read_oauth_account(&config_json).and_then(|a| a.get("accountUuid").and_then(Value::as_str).map(str::to_string)) {
+            if Config::load(env.paths)?.accounts.iter().any(|a| a.uuid.as_deref() == Some(uuid.as_str())) {
+                return Ok(None);
+            }
+        }
+        // A free id, so a saved account with the usual id never blocks the recovery.
+        let id = read_oauth_account(&config_json).map(|account| {
+            let uuid = account.get("accountUuid").and_then(Value::as_str).unwrap_or("");
+            let base = suggest_id(account.get("emailAddress").and_then(Value::as_str), uuid);
+            free_id(&Config::load(env.paths).unwrap_or_default(), &base)
+        });
+        let source = LoginSource { service: service.to_string(), config_json: Some(config_json) };
+        self.import_login(env, &source, id.as_deref(), None, false).map(Some)
     }
 
     // ----- doctor -----
@@ -1098,6 +1289,20 @@ fn suggest_id(email: Option<&str>, uuid: &str) -> String {
     let base = base.trim_matches('-');
     let base = if base.is_empty() { format!("claude-{}", uuid.chars().take(6).collect::<String>()) } else { format!("claude-{base}") };
     base.chars().take(32).collect::<String>().trim_end_matches('-').to_string()
+}
+
+/// `base`, or `base-2`, `base-3`... (kept within the id length limit) until no saved account uses it.
+fn free_id(config: &Config, base: &str) -> String {
+    (1..)
+        .map(|n| if n == 1 { base.to_string() } else { suffixed_id(base, n) })
+        .find(|id| config.account(id).is_none())
+        .expect("an unused id exists")
+}
+
+fn suffixed_id(base: &str, n: u32) -> String {
+    let suffix = format!("-{n}");
+    let head: String = base.chars().take(32 - suffix.len()).collect();
+    format!("{}{suffix}", head.trim_end_matches('-'))
 }
 
 impl Surface for ClaudeCode {

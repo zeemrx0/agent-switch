@@ -43,7 +43,7 @@ fn script_name(provider: Provider, flow: Flow) -> &'static str {
 fn provider_lines(provider: Provider, flow: Flow) -> &'static str {
     match (provider, flow) {
         (Provider::Claude, Flow::New) => {
-            "echo \"Claude opens next. Type /login, finish signing in, then type /exit.\"\n\"$bin\" add claude-cli\n"
+            "echo \"Claude opens next. Type /login and finish signing in. The account is saved right after sign-in. Then type /exit or close this window.\"\n\"$bin\" add claude-cli\n"
         }
         (Provider::Claude, Flow::Current) => {
             "echo \"Saving the login that Claude Code already holds.\"\n\"$bin\" add claude-cli --from-keychain-item \"Claude Code-credentials\"\n"
@@ -129,6 +129,8 @@ mod tests {
     #[test]
     fn each_script_runs_its_providers_subcommand() {
         assert!(script(Provider::Claude, Flow::New).contains("\"$bin\" add claude-cli\n"));
+        let claude = script(Provider::Claude, Flow::New);
+        assert!(claude.contains("The account is saved right after sign-in. Then type /exit or close this window."), "{claude}");
         assert!(script(Provider::Openai, Flow::New).contains("\"$bin\" add openai\n"));
         assert!(script(Provider::Antigravity, Flow::New).contains("\"$bin\" add antigravity-cli --id"));
         assert!(!script(Provider::Claude, Flow::New).contains("openai") && !script(Provider::Openai, Flow::New).contains("claude-cli"));

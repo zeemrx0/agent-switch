@@ -1030,12 +1030,246 @@ fn interactive_add_saves_the_new_login_and_cleans_up() {
     let tmp = fx.paths.support_dir().join("tmp");
     assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "the temporary profile folder was removed");
 
-    // A failing `claude` saves nothing and still cleans up.
-    let failing = ClaudeCode::new(kc.clone(), fx.profiles.clone(), Arc::new(|k| (k == "USER").then(|| USER.to_string()))).with_claude_binary("/usr/bin/false");
+    // A failing `claude` with no login saves nothing and still cleans up.
+    let empty = Arc::new(MemoryKeychain::new());
+    let failing = ClaudeCode::new(empty.clone(), fx.profiles.clone(), Arc::new(|k| (k == "USER").then(|| USER.to_string()))).with_claude_binary("/usr/bin/false");
     assert!(failing.add_interactive(&fx.env(), Some("nope"), None).is_err());
     assert!(fx.config().account("nope").is_none());
     assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
-    assert_eq!(kc.deleted.lock().unwrap().len(), 2);
+    assert!(empty.is_empty());
+}
+
+/// A `claude` stand-in: writes the profile's `.claude.json` like a finished /login, then runs `rest`.
+fn fake_claude(fx: &Fx, rest: &str) -> PathBuf {
+    let script = fx.paths.home().join("fake-claude.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '{{\"oauthAccount\":{{\"accountUuid\":\"u-new\",\"emailAddress\":\"new@example.com\"}}}}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"\n{rest}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    script
+}
+
+fn adapter_over(fx: &Fx, kc: Arc<dyn Keychain>, claude: impl Into<PathBuf>) -> ClaudeCode {
+    ClaudeCode::new(kc, fx.profiles.clone(), Arc::new(|k| (k == "USER").then(|| USER.to_string()))).with_claude_binary(claude)
+}
+
+#[test]
+fn interactive_add_saves_the_login_while_claude_is_still_running() {
+    let fx = Fx::new();
+    let saved_marker = fx.paths.home().join("saved-while-running");
+    // Claude waits for the account to show up in the config; it only does so if the save happened during the run.
+    let rest = format!(
+        "i=0\nwhile [ $i -lt 40 ]; do\n  if grep -q 'during' '{}' 2>/dev/null; then touch '{}'; break; fi\n  sleep 0.25; i=$((i+1))\ndone",
+        fx.paths.config_file().display(),
+        saved_marker.display()
+    );
+    let script = fake_claude(&fx, &rest);
+    let kc = Arc::new(LoginAppears { deleted: Mutex::new(HashSet::new()), value: compact_ascii(&login("acc-N1", "ref-N1")).unwrap() });
+    fx.profiles.know("acc-N1", "u-new");
+
+    let done = adapter_over(&fx, kc.clone(), &script).add_interactive(&fx.env(), Some("during"), None).unwrap();
+    assert!(done.created);
+    assert!(saved_marker.exists(), "the account was saved before claude exited");
+    assert_eq!(kc.deleted.lock().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(fx.paths.support_dir().join("tmp")).unwrap().count(), 0);
+}
+
+#[test]
+fn interactive_add_saves_the_login_after_claude_exits_with_an_error() {
+    let fx = Fx::new();
+    // The window was closed: claude ended on a signal-like status after the login existed.
+    let script = fake_claude(&fx, "exit 129");
+    let kc = Arc::new(LoginAppears { deleted: Mutex::new(HashSet::new()), value: compact_ascii(&login("acc-N1", "ref-N1")).unwrap() });
+    fx.profiles.know("acc-N1", "u-new");
+
+    let done = adapter_over(&fx, kc.clone(), &script).add_interactive(&fx.env(), Some("late"), None).unwrap();
+    assert!(done.created);
+    assert_eq!(fx.slot("late").oauth_account["emailAddress"], "new@example.com");
+    assert_eq!(kc.deleted.lock().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(fx.paths.support_dir().join("tmp")).unwrap().count(), 0);
+}
+
+#[test]
+fn an_abandoned_profile_of_a_dead_process_is_saved_and_removed() {
+    let fx = Fx::new();
+    let tmp = fx.paths.support_dir().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let kc = Arc::new(MemoryKeychain::new());
+    let profile = |name: &str, uuid: &str, access: &str| -> PathBuf {
+        let dir = tmp.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".claude.json"), json!({"oauthAccount": oauth_account(uuid)}).to_string()).unwrap();
+        kc.set(&keychain_service_name(dir.to_str().unwrap()), USER, &compact_ascii(&login(access, "ref-x")).unwrap()).unwrap();
+        dir
+    };
+    let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    let dead = gone.id();
+    let lost = profile(&format!("claude-add-{dead}-abc"), "u-lost", "acc-L1");
+    let known = profile(&format!("claude-add-{dead}-def"), "u-team", "acc-K1");
+    let running = profile(&format!("claude-add-{}-abc", std::process::id()), "u-running", "acc-R1");
+    let unrelated = tmp.join("not-an-add-profile");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    let target = fx.paths.home().join("link-target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("keep"), "x").unwrap();
+    let link = tmp.join(format!("claude-add-{dead}-aaa"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link_item = keychain_service_name(link.to_str().unwrap());
+    kc.set(&link_item, USER, &compact_ascii(&login("acc-S1", "ref-x")).unwrap()).unwrap();
+    for (access, uuid) in [("acc-L1", "u-lost"), ("acc-K1", "u-team"), ("acc-R1", "u-running")] {
+        fx.profiles.know(access, uuid);
+    }
+    kc.set(LIVE_SERVICE, USER, "live-login").unwrap();
+    kc.set("Claude Code-credentials-00000000", USER, "other-profile").unwrap();
+    let team_before = fx.vault.get("team", STORE).unwrap().unwrap().blob;
+
+    // The new sign-in itself fails; recovery runs before it.
+    assert!(adapter_over(&fx, kc.clone(), "/usr/bin/false").add_interactive(&fx.env(), None, None).is_err());
+
+    let config = fx.config();
+    let recovered = config.accounts.iter().find(|a| a.uuid.as_deref() == Some("u-lost")).expect("the lost login was saved");
+    assert_eq!(fx.slot(&recovered.id).oauth_account["emailAddress"], "u-lost@example.com");
+    assert!(!lost.exists() && !known.exists(), "dead-process folders are removed");
+    assert!(kc.get(&keychain_service_name(lost.to_str().unwrap()), USER).unwrap().is_none());
+    assert!(kc.get(&keychain_service_name(known.to_str().unwrap()), USER).unwrap().is_none());
+    assert_eq!(fx.vault.get("team", STORE).unwrap().unwrap().blob, team_before, "an account that is already saved is not overwritten");
+    assert!(config.accounts.iter().all(|a| a.uuid.as_deref() != Some("u-running")));
+    assert!(running.exists() && unrelated.exists(), "a folder of a live process and unrelated folders stay");
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink() && target.join("keep").exists(), "a link is never followed or removed");
+    assert!(kc.get(&link_item, USER).unwrap().is_some());
+    assert!(kc.get(&keychain_service_name(running.to_str().unwrap()), USER).unwrap().is_some());
+    assert_eq!(kc.get(LIVE_SERVICE, USER).unwrap().as_deref(), Some("live-login"));
+    assert_eq!(kc.get("Claude Code-credentials-00000000", USER).unwrap().as_deref(), Some("other-profile"));
+}
+
+/// Hashed item whose value switches to `rotated` once `marker` exists, like a login that claude refreshed.
+struct Rotating {
+    marker: PathBuf,
+    first: String,
+    rotated: String,
+}
+
+impl Keychain for Rotating {
+    fn get(&self, service: &str, _account: &str) -> Result<Option<String>> {
+        Ok(service.starts_with("Claude Code-credentials-").then(|| if self.marker.exists() { self.rotated.clone() } else { self.first.clone() }))
+    }
+    fn set(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &str, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn name(&self) -> &'static str {
+        "rotating"
+    }
+}
+
+#[test]
+fn a_login_that_claude_refreshed_after_the_save_replaces_the_saved_one_before_cleanup() {
+    let fx = Fx::new();
+    let marker = fx.paths.home().join("rotated");
+    let rest = format!(
+        "i=0\nwhile [ $i -lt 40 ]; do\n  if grep -q 'rot' '{}' 2>/dev/null; then break; fi\n  sleep 0.25; i=$((i+1))\ndone\ntouch '{}'\nexit 129",
+        fx.paths.config_file().display(),
+        marker.display()
+    );
+    let script = fake_claude(&fx, &rest);
+    let kc = Arc::new(Rotating {
+        marker,
+        first: compact_ascii(&login("acc-N1", "ref-N1")).unwrap(),
+        rotated: compact_ascii(&login("acc-N2", "ref-N2")).unwrap(),
+    });
+    fx.profiles.know("acc-N1", "u-new");
+    fx.profiles.know("acc-N2", "u-new");
+
+    let done = adapter_over(&fx, kc, &script).add_interactive(&fx.env(), Some("rot"), None).unwrap();
+    assert!(done.created);
+    let blob = fx.vault.get("rot", STORE).unwrap().unwrap().blob;
+    assert!(blob.contains("ref-N2") && !blob.contains("ref-N1"), "the refreshed token is the saved one: {blob}");
+    assert_eq!(fx.config().accounts.iter().filter(|a| a.uuid.as_deref() == Some("u-new")).count(), 1);
+}
+
+#[test]
+fn recovery_picks_a_free_id_when_the_usual_one_belongs_to_another_account() {
+    let fx = Fx::new();
+    Config::update(&fx.paths, |c| {
+        c.add_account(Account { id: "claude-u-lost".into(), provider: Provider::Claude, label: "x".into(), email: None, uuid: Some("u-other".into()) })
+    })
+    .unwrap();
+    let tmp = fx.paths.support_dir().join("tmp");
+    let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    let dir = tmp.join(format!("claude-add-{}-abc", gone.id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".claude.json"), json!({"oauthAccount": oauth_account("u-lost")}).to_string()).unwrap();
+    let kc = Arc::new(MemoryKeychain::new());
+    kc.set(&keychain_service_name(dir.to_str().unwrap()), USER, &compact_ascii(&login("acc-L1", "ref-x")).unwrap()).unwrap();
+    fx.profiles.know("acc-L1", "u-lost");
+
+    assert!(adapter_over(&fx, kc.clone(), "/usr/bin/false").add_interactive(&fx.env(), None, None).is_err());
+    let config = fx.config();
+    let recovered = config.accounts.iter().find(|a| a.uuid.as_deref() == Some("u-lost")).expect("recovered");
+    assert_eq!(recovered.id, "claude-u-lost-2");
+    assert!(!dir.exists() && kc.is_empty());
+}
+
+#[test]
+fn the_explicit_id_of_the_current_add_wins_over_recovery() {
+    let fx = Fx::new();
+    let tmp = fx.paths.support_dir().join("tmp");
+    let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    // An abandoned profile of the very same account that the current add signs in.
+    let stale = tmp.join(format!("claude-add-{}-abc", gone.id()));
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join(".claude.json"), json!({"oauthAccount": oauth_account("u-new")}).to_string()).unwrap();
+    let script = fake_claude(&fx, "exit 0");
+    let kc = Arc::new(LoginAppears { deleted: Mutex::new(HashSet::new()), value: compact_ascii(&login("acc-N1", "ref-N1")).unwrap() });
+    fx.profiles.know("acc-N1", "u-new");
+
+    adapter_over(&fx, kc, &script).add_interactive(&fx.env(), Some("mine"), None).unwrap();
+    let ids: Vec<String> = fx.config().accounts.iter().filter(|a| a.uuid.as_deref() == Some("u-new")).map(|a| a.id.clone()).collect();
+    assert_eq!(ids, ["mine"]);
+    assert!(!stale.exists(), "the leftover folder is still cleaned");
+}
+
+fn hangup_handler() -> libc::sighandler_t {
+    // SAFETY: only reads the current disposition.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        assert_eq!(libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut action), 0);
+        action.sa_sigaction
+    }
+}
+
+#[test]
+fn the_hangup_guard_handles_sighup_for_this_process_only_and_restores_it() {
+    use std::os::unix::process::ExitStatusExt;
+    // Hold the lock from before the first read, so no other test's guard changes the state in between.
+    let lock = HANGUP_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let before = hangup_handler();
+    {
+        let _guard = HangupGuard::install_holding(lock);
+        assert_eq!(hangup_handler(), ignore_hangup as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        // A child still dies on its own hangup: the handler is not inherited as "ignore".
+        let status = Command::new("/bin/sh").args(["-c", "kill -HUP $$; sleep 5"]).status().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGHUP));
+    }
+    assert_eq!(hangup_handler(), before);
+}
+
+#[test]
+fn only_add_profile_folder_names_carry_a_pid() {
+    assert_eq!(add_profile_pid("claude-add-123-1a2b"), Some(123));
+    for bad in ["claude-add-", "claude-add-x-1", "claude-add-12-", "claude-add-12-zz", "claude-add-0-1", "claude-add--1-1", "other-12-1", "add-account-claude.command"] {
+        assert_eq!(add_profile_pid(bad), None, "{bad}");
+    }
+    assert!(pid_alive(std::process::id() as i32));
 }
 
 #[test]

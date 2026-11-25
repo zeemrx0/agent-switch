@@ -7,6 +7,8 @@ mod list_command;
 mod registry;
 mod statusline_command;
 
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -145,7 +147,8 @@ fn main() {
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("error: {e}");
+            // A closed terminal makes this write fail; the exit code still reports the error.
+            let _ = writeln!(std::io::stderr(), "error: {e}");
             std::process::exit(1);
         }
     }

@@ -1,6 +1,8 @@
 //! `agent-switch add claude-cli`: log in a new account in a throwaway profile, or save a login that
 //! already sits in a Keychain item (`--from-keychain-item`).
 
+use std::io::Write;
+
 use agent_switch_core::adapters::claude_code::ClaudeCode;
 use agent_switch_core::config::mask_email;
 use agent_switch_core::{Error, Result};
@@ -30,9 +32,11 @@ pub fn run(opts: &AddOptions) -> Result<i32> {
         (false, true) => "added",
         (false, false) => "refreshed the saved login of",
     };
-    println!("claude-cli: {verb} `{}` ({who}{plan})", done.id);
+    // The terminal may be gone after a closed window; a failed write must not turn a saved account into a panic.
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "claude-cli: {verb} `{}` ({who}{plan})", done.id);
     if !done.dry_run && done.created {
-        println!("bind it with `agent-switch bind claude-cli {}`, or use it once with `agent-switch switch claude-cli {}`", done.id, done.id);
+        let _ = writeln!(out, "bind it with `agent-switch bind claude-cli {}`, or use it once with `agent-switch switch claude-cli {}`", done.id, done.id);
     }
     Ok(0)
 }
