@@ -1153,6 +1153,30 @@ fn apply_skips_mirror_on_untested_version() {
 }
 
 #[test]
+fn apply_mirrors_on_newer_version() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 1));
+    session_folder(&team, U_TEAM);
+    let sys = Rc::new(FakeSystem::new(true));
+    let a = fx.adapter(&sys).with_desktop_version("7.37095.0");
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(has_session(&team, U_TEAM, S1));
+    assert_eq!(a.mirror_warning(), None);
+}
+
+#[test]
+fn desktop_version_comparison() {
+    assert!(desktop_version_supported(TESTED_CLAUDE_DESKTOP));
+    assert!(desktop_version_supported("5.0.0"));
+    assert!(desktop_version_supported("4.23119.0"));
+    assert!(desktop_version_supported("7.37095.0"));
+    assert!(!desktop_version_supported("4.23117.9"));
+    assert!(!desktop_version_supported("0.0.1"));
+    assert!(!desktop_version_supported("garbage"));
+    assert!(!desktop_version_supported(""));
+}
+
+#[test]
 fn apply_mirrors_before_reopen() {
     let (fx, team, config) = bound_fixture();
     put_session(&fx.default(), U_PERSONAL, &session(S1, 3));

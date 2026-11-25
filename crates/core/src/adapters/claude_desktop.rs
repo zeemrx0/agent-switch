@@ -38,8 +38,24 @@ use crate::proc;
 use crate::state::now_secs;
 use crate::surface::{Env, Identity, Staged, Surface};
 
-/// The Claude Desktop version this adapter was tested with (2026-11-06).
+/// The oldest Claude Desktop version this adapter was tested with (2026-11-06). Newer versions are
+/// accepted; the per-record checks in the session mirror guard against format changes.
 pub const TESTED_CLAUDE_DESKTOP: &str = "4.23118.0";
+
+/// Whether `version` is at least the tested one. Compares dotted numeric components; an unparsable
+/// version is not supported.
+fn desktop_version_supported(version: &str) -> bool {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        v.trim().split('.').map(|p| p.parse().ok()).collect()
+    }
+    let (Some(mut have), Some(mut min)) = (parts(version), parts(TESTED_CLAUDE_DESKTOP)) else {
+        return false;
+    };
+    let len = have.len().max(min.len());
+    have.resize(len, 0);
+    min.resize(len, 0);
+    have >= min
+}
 
 const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 5_000 });
 const SQLITE3: &str = "/usr/bin/sqlite3";
@@ -488,14 +504,14 @@ impl ClaudeDesktop {
         )
     }
 
-    /// Mirror the session records between profiles when this Desktop version is the tested one. Never
+    /// Mirror the session records between profiles when this Desktop version is at least the tested one. Never
     /// fails the switch: the result lands in `mirror_summary` or `mirror_warning`.
     fn mirror_sessions(&self, paths: &Paths) {
         let installed = self.version_override.clone().or_else(|| macos_apps::app_version(CLAUDE.bundle_path));
-        if installed.as_deref() != Some(TESTED_CLAUDE_DESKTOP) {
+        if !installed.as_deref().is_some_and(desktop_version_supported) {
             let found = installed.map_or_else(|| "not installed".to_string(), |v| format!("is {v}"));
             self.mirror_warning.replace(Some(format!(
-                "sessions were not mirrored: Claude Desktop {found}, mirroring is tested with {TESTED_CLAUDE_DESKTOP}"
+                "sessions were not mirrored: Claude Desktop {found}, mirroring needs {TESTED_CLAUDE_DESKTOP} or newer"
             )));
             return;
         }
@@ -737,9 +753,9 @@ fn mirror_checks(env: &Env, out: &mut Vec<Check>) {
         out.push(check(Level::Warn, "session mirror off (disabled by you; run `agent-switch desktop-sessions on`)"));
         return;
     }
-    if installed.as_deref() != Some(TESTED_CLAUDE_DESKTOP) {
+    if !installed.as_deref().is_some_and(desktop_version_supported) {
         let found = installed.map_or_else(|| "not installed".to_string(), |v| format!("{v} untested"));
-        out.push(check(Level::Warn, format!("session mirror off (Claude {found}; tested with {TESTED_CLAUDE_DESKTOP})")));
+        out.push(check(Level::Warn, format!("session mirror off (Claude {found}; needs {TESTED_CLAUDE_DESKTOP} or newer)")));
         return;
     }
     if file.exists() {
@@ -757,8 +773,8 @@ fn mirror_checks(env: &Env, out: &mut Vec<Check>) {
 pub fn doctor_checks(env: &Env) -> Vec<Check> {
     let mut out = Vec::new();
     match macos_apps::app_version(CLAUDE.bundle_path) {
-        Some(v) if v == TESTED_CLAUDE_DESKTOP => out.push(check(Level::Ok, format!("Claude {v}"))),
-        Some(v) => out.push(check(Level::Warn, format!("Claude {v} (tested with {TESTED_CLAUDE_DESKTOP}); re-test a switch after an update"))),
+        Some(v) if desktop_version_supported(&v) => out.push(check(Level::Ok, format!("Claude {v}"))),
+        Some(v) => out.push(check(Level::Warn, format!("Claude {v} (older than {TESTED_CLAUDE_DESKTOP}); session mirror needs {TESTED_CLAUDE_DESKTOP} or newer"))),
         None => out.push(check(Level::Warn, format!("{} not found", CLAUDE.bundle_path))),
     }
 
