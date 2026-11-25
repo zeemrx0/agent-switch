@@ -139,6 +139,36 @@ pub fn remove_account(paths: &Paths, vault: &Vault, id: &str) -> Result<Account>
     Ok(account)
 }
 
+/// Delete an account like `remove_account`, but first make every surface that is bound to it or has it
+/// active unmanaged, in the same config write that removes it. For a caller that logs an account out while
+/// surfaces still use it; the live login of the provider's own app is not touched. `before` runs under the
+/// account lock and ahead of any change, and an error from it stops everything (a caller's own refusal).
+/// Nothing is saved unless the config write succeeds.
+pub fn remove_account_unmanaging<T>(paths: &Paths, vault: &Vault, id: &str, before: impl FnOnce() -> Result<T>) -> Result<(Account, T)> {
+    let _lock = AccountLock::acquire(paths, id, LOCK_TIMEOUT)?;
+    let checked = before()?;
+    let active_on = State::load(paths)?.is_active_anywhere(id);
+    let account = Config::update(paths, |config| {
+        if config.account(id).is_none() {
+            return Err(Error::NotFound(format!("account `{id}`")));
+        }
+        for kind in config.surfaces_bound_to(id).into_iter().chain(active_on.iter().copied()) {
+            config.bind(kind, Binding::Unmanaged)?;
+        }
+        config.remove_account(id)
+    })?;
+    State::update(paths, |s| {
+        for kind in &active_on {
+            s.set_active(*kind, None);
+        }
+        s.forget_account(id);
+    })?;
+    vault
+        .delete(id, account.provider.store())
+        .map_err(|e| Error::Keychain(format!("account `{id}` was removed from the config but its vault slot remains: {e}")))?;
+    Ok((account, checked))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +325,44 @@ mod tests {
         assert!(f.vault.get("personal", "claude-oauth").unwrap().is_none());
         assert!(State::load(&f.paths).unwrap().journal.is_empty());
         assert!(f.vault.get("team", "claude-oauth").unwrap().is_some());
+    }
+
+    #[test]
+    fn removing_unmanaging_clears_surfaces_where_the_account_is_bound_or_active() {
+        let f = fixture();
+        let env = Env { paths: &f.paths, vault: &f.vault };
+        // Bound on the Claude CLI; active (not bound) on Claude Desktop, which is bound to `team`.
+        bind(&f.paths, SurfaceKind::ClaudeCli, Binding::parse("personal")).unwrap();
+        bind(&f.paths, SurfaceKind::ClaudeDesktop, Binding::parse("team")).unwrap();
+        activate(&env, &f.config, &Fake::new(SurfaceKind::ClaudeDesktop), "personal").unwrap();
+
+        let (removed, token) = remove_account_unmanaging(&f.paths, &f.vault, "personal", || Ok(7)).unwrap();
+        assert_eq!((removed.id.as_str(), token), ("personal", 7));
+        let c = Config::load(&f.paths).unwrap();
+        assert!(c.account("personal").is_none());
+        assert_eq!(c.surfaces.claude_cli, Binding::Unmanaged);
+        assert_eq!(c.surfaces.claude_desktop, Binding::Unmanaged, "active there, so it is unmanaged too");
+        assert!(State::load(&f.paths).unwrap().is_active_anywhere("personal").is_empty());
+        assert!(f.vault.get("personal", "claude-oauth").unwrap().is_none());
+        assert!(f.vault.get("team", "claude-oauth").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_refused_unmanaging_removal_changes_nothing() {
+        let f = fixture();
+        let env = Env { paths: &f.paths, vault: &f.vault };
+        bind(&f.paths, SurfaceKind::ClaudeCli, Binding::parse("personal")).unwrap();
+        activate(&env, &f.config, &Fake::new(SurfaceKind::ClaudeCli), "personal").unwrap();
+        let before = std::fs::read_to_string(f.paths.config_file()).unwrap();
+
+        let refused = remove_account_unmanaging(&f.paths, &f.vault, "personal", || -> Result<()> { Err(Error::Invalid("not now".into())) });
+        assert!(refused.unwrap_err().to_string().contains("not now"));
+        assert_eq!(std::fs::read_to_string(f.paths.config_file()).unwrap(), before);
+        assert_eq!(State::load(&f.paths).unwrap().active(SurfaceKind::ClaudeCli), Some("personal"));
+        assert!(f.vault.get("personal", "claude-oauth").unwrap().is_some());
+
+        assert!(matches!(remove_account_unmanaging(&f.paths, &f.vault, "ghost", || Ok(())), Err(Error::NotFound(_))));
+        assert_eq!(std::fs::read_to_string(f.paths.config_file()).unwrap(), before, "an unknown account changes nothing");
     }
 
     #[test]

@@ -29,7 +29,7 @@ use agent_switch_core::vault::Vault;
 use agent_switch_core::watcher::{Event, Relaunch, Watcher};
 use agent_switch_core::{switch, Error, Result};
 
-use crate::add_account;
+use crate::add_account::{self, Flow};
 use crate::menu::{label_of, provider_title, surface_name, Action};
 
 pub enum Cmd {
@@ -299,6 +299,21 @@ impl Job<'_> {
         Ok(Some(on_account(kind, &label_of(&config, &id), mirrored)))
     }
 
+    /// Remove `id` from agent-switch like `agent-switch remove`, in one locked step. Every surface that is
+    /// bound to the account or has it active becomes unmanaged, because the plain removal refuses an
+    /// account in use. The login that the provider's own app holds is not touched.
+    fn log_out(&self, id: &str) -> Result<String> {
+        let paths = self.env.paths;
+        let label = label_of(&Config::load(paths)?, id);
+        // Refuses, before anything changes, while Claude Desktop holds the account's profile.
+        let plan = || claude_desktop::manage::plan_remove(paths, &SystemApps, id).map_err(|e| desktop_refusal(&label, e));
+        let (_, profile) = switch::remove_account_unmanaging(paths, self.env.vault, id, plan)?;
+        if let Some(entry) = profile {
+            claude_desktop::manage::finish_remove(paths, id, &entry)?;
+        }
+        Ok(format!("Logged out {label}: its saved login was removed from agent-switch."))
+    }
+
     /// Do what a click asked for. `Ok(Some(text))` is a message for the user.
     fn handle(&mut self, action: Action) -> Result<Option<String>> {
         let paths = self.env.paths;
@@ -348,9 +363,14 @@ impl Job<'_> {
                 Ok(Some(if opened { format!("Opened Claude on {label}.") } else { format!("Claude is already open on {label}.") }))
             }
             Action::AddAccount(provider) => {
-                add_account::open_terminal(paths, provider)?;
+                add_account::open_terminal(paths, provider, Flow::New)?;
                 Ok(Some(format!("Opened Terminal to add a {} account.", provider_title(provider))))
             }
+            Action::SaveCurrentLogin(provider) => {
+                add_account::open_terminal(paths, provider, Flow::Current)?;
+                Ok(Some(format!("Opened Terminal to save the current {} login.", provider_title(provider))))
+            }
+            Action::LogOut(id) => self.log_out(&id).map(Some),
             Action::Relaunch { kind, event_id } => {
                 self.consent.set(true);
                 let result = self.watcher.relaunch(kind, &event_id, now_secs());
@@ -363,6 +383,18 @@ impl Job<'_> {
             }
             Action::SetLoginItem(_) | Action::Quit => Ok(None), // handled on the UI thread
         }
+    }
+}
+
+/// The refusal of `plan_remove`, worded for the menu: what stopped the log out and what to do.
+fn desktop_refusal(label: &str, cause: Error) -> Error {
+    let Error::Invalid(text) = &cause else { return cause };
+    if text.contains("protected Claude Desktop folder") {
+        Error::Invalid(format!("{label} holds the original Claude Desktop data, which agent-switch never deletes, so it cannot be logged out."))
+    } else if text.contains("default folder") || text.contains("Claude is running") {
+        Error::Invalid(format!("{label} is in use by Claude Desktop. Switch Claude Desktop to another account and quit Claude, then log out {label} again."))
+    } else {
+        cause
     }
 }
 
@@ -386,6 +418,7 @@ mod tests {
     use super::*;
     use agent_switch_core::config::{Account, Provider};
     use agent_switch_core::keychain::MemoryKeychain;
+    use agent_switch_core::state::State;
     use agent_switch_core::usage::LiveApi;
 
     /// A real home in a temp folder with fake keychain; the worker's pure handlers run against it.
@@ -558,6 +591,56 @@ mod tests {
             let c = Config::load(&h.paths).unwrap();
             assert_eq!(c.surfaces.claude_desktop, Binding::Unmanaged);
             assert!(c.priority.claude_desktop.is_empty(), "a failed pick writes no priority");
+        });
+    }
+
+    #[test]
+    fn logging_out_removes_the_account_and_leaves_the_surfaces_it_used_unmanaged() {
+        let h = home();
+        with_job(&h, |job| {
+            job.handle(Action::Bind(SurfaceKind::ClaudeDesktop, Binding::parse("a"))).unwrap();
+            State::update(&h.paths, |s| s.set_active(SurfaceKind::ClaudeCli, Some("a".into()))).unwrap();
+
+            let said = job.handle(Action::LogOut("a".into())).unwrap().unwrap();
+            assert!(said.contains("Logged out A"), "{said}");
+            let c = Config::load(&h.paths).unwrap();
+            assert!(c.account("a").is_none() && c.account("b").is_some());
+            assert_eq!(c.surfaces.claude_desktop, Binding::Unmanaged);
+            assert!(!c.priority(SurfaceKind::ClaudeDesktop).contains(&"a".to_string()));
+            assert!(State::load(&h.paths).unwrap().is_active_anywhere("a").is_empty());
+        });
+    }
+
+    #[test]
+    fn logging_out_also_unmanages_a_surface_that_only_has_the_account_active() {
+        let h = home();
+        with_job(&h, |job| {
+            switch::bind(&h.paths, SurfaceKind::ClaudeCli, Binding::parse("b")).unwrap();
+            State::update(&h.paths, |s| s.set_active(SurfaceKind::ClaudeCli, Some("a".into()))).unwrap();
+            job.handle(Action::LogOut("a".into())).unwrap();
+            assert_eq!(Config::load(&h.paths).unwrap().surfaces.claude_cli, Binding::Unmanaged);
+            assert_eq!(State::load(&h.paths).unwrap().active(SurfaceKind::ClaudeCli), None);
+        });
+    }
+
+    #[test]
+    fn a_desktop_refusal_says_why_and_what_to_do_in_menu_words() {
+        let in_use = Error::Invalid("the Claude default folder /x currently points at the profile of `a`. Switch Claude Desktop to another account first, then remove `a`".into());
+        let said = desktop_refusal("Alpha", in_use).to_string();
+        assert!(said.contains("Alpha is in use by Claude Desktop") && said.contains("Switch Claude Desktop to another account") && !said.contains("remove"), "{said}");
+        let protected = Error::Invalid("`a` owns the protected Claude Desktop folder /x (the original Claude data).".into());
+        assert!(desktop_refusal("Alpha", protected).to_string().contains("original Claude Desktop data"));
+        let other = Error::NotFound("account `a`".into());
+        assert!(matches!(desktop_refusal("Alpha", other), Error::NotFound(_)));
+    }
+
+    #[test]
+    fn logging_out_an_unknown_account_changes_nothing() {
+        let h = home();
+        with_job(&h, |job| {
+            let err = job.handle(Action::LogOut("nope".into())).unwrap_err().to_string();
+            assert!(err.contains("nope"), "{err}");
+            assert_eq!(Config::load(&h.paths).unwrap().accounts.len(), 2);
         });
     }
 

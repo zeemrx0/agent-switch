@@ -42,6 +42,12 @@ pub enum Action {
     OpenClaude,
     /// Open Terminal on the `agent-switch add` command of a provider, to sign in a new account.
     AddAccount(Provider),
+    /// Open Terminal on the `agent-switch add` command that saves the login the provider's own app holds.
+    SaveCurrentLogin(Provider),
+    /// Remove an account from agent-switch, like `agent-switch remove`: its saved login leaves the vault and
+    /// the config. The login that the provider's own app holds is not touched. The UI thread asks for
+    /// confirmation before it sends this to the worker.
+    LogOut(String),
     /// Answer a pending switch-needed event, like the notification button does.
     Relaunch { kind: SurfaceKind, event_id: String },
     SetLoginItem(bool),
@@ -307,6 +313,8 @@ fn account_entry(state: &State, account: &Account, surfaces: (SurfaceKind, Optio
     }
     children.push(Entry::Separator);
     children.extend(info_lines(rec, &usage, now));
+    children.push(Entry::Separator);
+    children.push(Entry::item("Log out", Action::LogOut(id.to_string())));
     Entry::Account(AccountRow { cli: cli_current == Some(id), app: app_current == Some(id), name: account_name(account), usage, children })
 }
 
@@ -502,9 +510,14 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     }
     if !any {
         out.push(Entry::disabled("No saved accounts"));
+        out.push(Entry::disabled("Signed in already? Add account > Save current login"));
         out.push(Entry::Separator);
     }
-    let add = Provider::ALL.into_iter().map(|p| Entry::item(format!("{}…", provider_title(p)), Action::AddAccount(p))).collect();
+    let mut add: Vec<Entry> = Provider::ALL.into_iter().map(|p| Entry::item(format!("{}…", provider_title(p)), Action::AddAccount(p))).collect();
+    add.push(Entry::Separator);
+    // Antigravity has no row here: its item above already saves the login that `agy` holds.
+    add.push(Entry::item("Save current Claude Code login", Action::SaveCurrentLogin(Provider::Claude)));
+    add.push(Entry::item("Save current ChatGPT and Codex login", Action::SaveCurrentLogin(Provider::Openai)));
     out.push(Entry::Submenu { text: "Add account".into(), entries: add });
     out.extend(footer(config, ctx));
     out
@@ -723,18 +736,19 @@ mod tests {
         assert_eq!(personal[3], Entry::disabled("5h: 32% used, resets in 2h 10m"));
         assert_eq!(personal[4], Entry::disabled("Week: 40% used, resets in 3d 4h"));
         assert_eq!(personal[5], Entry::disabled("Updated 2m ago"));
+        assert_eq!(personal[6..], [Entry::Separator, Entry::item("Log out", Action::LogOut("personal".into()))], "Log out comes last");
 
         let team = &find_row(&menu, "Team").children;
         assert_eq!(team[0], Entry::choice("Use for CLI", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::Account("team".into()))));
         assert_eq!(team[1], Entry::Item { text: "Use for Desktop".into(), action: None, checked: Some(true), enabled: true });
-        assert_eq!(team[3..], [Entry::disabled("no reading yet")], "no reading: only the note");
+        assert_eq!(team[3..5], [Entry::disabled("no reading yet"), Entry::Separator], "no reading: only the note");
 
         // A window that already reset has no reset time; a failed reading shows only its note.
         s.usage.insert("team".into(), UsageRecord { state: UsageState::Expired, ..reading(1.0, 1.0) });
         s.usage.insert("personal".into(), reading(10.0, 20.0));
         let later = build(&c, &s, &Ctx { now: NOW + 86_400 + 60, ..ctx() });
         assert_eq!(find_row(&later, "Personal").children[3], Entry::disabled("5h: 0% used"));
-        assert_eq!(find_row(&later, "Team").children[3..], [Entry::disabled("refreshes on use")]);
+        assert_eq!(find_row(&later, "Team").children[3..5], [Entry::disabled("refreshes on use"), Entry::Separator]);
         // The account of a provider without a desktop has no desktop choice.
         let mut g = config();
         g.add_account(account("g1", Provider::Antigravity, "G One")).unwrap();
@@ -863,7 +877,27 @@ Claude >
     #[test]
     fn without_any_account_the_menu_says_so_and_still_offers_add_account() {
         let text = to_text(&build(&Config::default(), &State::default(), &ctx()));
-        assert!(text.starts_with("No saved accounts (disabled)\n--------\nAdd account >\n"), "{text}");
+        assert!(
+            text.starts_with("No saved accounts (disabled)\nSigned in already? Add account > Save current login (disabled)\n--------\nAdd account >\n"),
+            "{text}"
+        );
+        assert!(text.contains("Save current Claude Code login") && text.contains("Save current ChatGPT and Codex login"), "{text}");
+    }
+
+    #[test]
+    fn every_account_submenu_ends_with_log_out_which_removes_only_that_account() {
+        let mut c = config();
+        c.add_account(account("g1", Provider::Antigravity, "G One")).unwrap();
+        let menu = build(&c, &State::default(), &ctx());
+        for id in ["personal", "team", "oa", "g1"] {
+            let row = menu.iter().find_map(|e| match e {
+                Entry::Account(r) if r.children.contains(&Entry::item("Log out", Action::LogOut(id.into()))) => Some(r),
+                _ => None,
+            });
+            let row = row.unwrap_or_else(|| panic!("no Log out for {id}: {}", to_text(&menu)));
+            assert_eq!(row.children.last(), Some(&Entry::item("Log out", Action::LogOut(id.into()))));
+        }
+        assert_eq!(to_text(&menu).matches("Log out").count(), 4, "one per account");
     }
 
     #[test]
@@ -877,6 +911,9 @@ Claude >
                 Entry::item("Claude…", Action::AddAccount(Provider::Claude)),
                 Entry::item("ChatGPT and Codex…", Action::AddAccount(Provider::Openai)),
                 Entry::item("Antigravity…", Action::AddAccount(Provider::Antigravity)),
+                Entry::Separator,
+                Entry::item("Save current Claude Code login", Action::SaveCurrentLogin(Provider::Claude)),
+                Entry::item("Save current ChatGPT and Codex login", Action::SaveCurrentLogin(Provider::Openai)),
             ]
         );
         assert!(!to_text(&menu).contains("Add account…"), "no per-provider rows");

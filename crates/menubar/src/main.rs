@@ -7,6 +7,7 @@
 
 mod account_row;
 mod add_account;
+mod confirm;
 mod icon;
 mod login_item;
 mod menu;
@@ -268,13 +269,32 @@ impl App {
                 }
                 self.refresh();
             }
-            other => {
-                if let Some(worker) = &self.worker {
-                    worker.send(other);
-                }
-                self.refresh();
-            }
+            // The worker never sees it until the user confirms.
+            Action::LogOut(id) => self.ask_to_log_out(&id),
+            other => self.confirmed(other),
         }
+    }
+
+    /// Ask before an account is removed. The dialog is modal and runs on this thread; "Log out" is not the
+    /// default button, so Return cancels.
+    fn ask_to_log_out(&mut self, id: &str) {
+        let label = Config::load(&self.paths).map_or_else(|_| id.to_string(), |c| menu::label_of(&c, id));
+        if confirm::ask(
+            &format!("Log out {label}?"),
+            "Its saved login is deleted from agent-switch, and surfaces that use it become unmanaged. The login that Claude, Codex or agy holds is not touched.",
+            "Log out",
+        ) {
+            self.confirmed(Action::LogOut(id.to_string()));
+        }
+        self.refresh();
+    }
+
+    /// Hand an action to the worker.
+    fn confirmed(&mut self, action: Action) {
+        if let Some(worker) = &self.worker {
+            worker.send(action);
+        }
+        self.refresh();
     }
 
     fn report(&mut self, report: Report) {
