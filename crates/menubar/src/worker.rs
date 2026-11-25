@@ -169,7 +169,10 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
     match first_launch::check(&env, &ClaudeCode::production()) {
         Outcome::NotFirst => {}
         Outcome::NothingSaved(why) => crate::log_line(&why),
-        Outcome::Saved(body) => {
+        Outcome::Saved { notice: body, skipped } => {
+            for why in skipped {
+                crate::log_line(&why);
+            }
             report(Report::Notice { title: "agent-switch".into(), body, dialog: false });
             report(Report::Changed);
         }

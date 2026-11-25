@@ -1,12 +1,15 @@
-//! First launch: save the login that Claude Code already holds, once.
+//! First launch: save the logins that Claude Code and ChatGPT/Codex already hold, once.
 //!
 //! The app has started for the first time when the config file does not exist. The check creates the file
-//! before it reads anything, so it runs once even when nothing is imported (Claude Code is signed out, the
-//! Keychain item is missing, the import fails), and two copies that start together cannot both import. It
-//! saves the account the same way `agent-switch add claude-cli --from-keychain-item "Claude Code-credentials"`
-//! does: no binding changes, and no other app (Claude Desktop, ChatGPT, Codex, Antigravity) is read.
+//! before it reads anything, so it runs once even when nothing is imported (signed out, the Keychain item or
+//! `auth.json` is missing, an import fails), and two copies that start together cannot both import. Each
+//! provider is independent: one that fails or has no login never stops the other. The accounts are saved the
+//! same way `agent-switch add claude-cli --from-keychain-item "Claude Code-credentials"` and
+//! `agent-switch add openai --from-file ~/.codex/auth.json` do: no binding changes, and no other app (Claude
+//! Desktop, Antigravity) is read.
 
-use agent_switch_core::adapters::claude_code::{ClaudeCode, Imported, LIVE_SERVICE};
+use agent_switch_core::adapters::claude_code::{ClaudeCode, Imported as ClaudeImported, LIVE_SERVICE};
+use agent_switch_core::adapters::codex::{self, Homes, Imported as CodexImported};
 use agent_switch_core::config::{mask_email, Config};
 use agent_switch_core::surface::Env;
 
@@ -17,30 +20,60 @@ pub enum Outcome {
     NotFirst,
     /// The first launch, but no account was saved. The text says why, for the log.
     NothingSaved(String),
-    /// The first launch saved an account. The text is the notice for the user.
-    Saved(String),
+    /// The first launch saved at least one account. `notice` is for the user. `skipped` lists, for the log,
+    /// the providers that saved nothing.
+    Saved { notice: String, skipped: Vec<String> },
 }
 
-/// "Saved your Claude Code login (a***@example.com)." with the masked email, else the account id.
-pub fn saved_notice(done: &Imported) -> String {
-    let who = done.email.as_deref().map(mask_email).unwrap_or_else(|| done.id.clone());
-    format!("Saved your Claude Code login ({who}).")
+fn who(email: Option<&str>, id: &str) -> String {
+    email.map(mask_email).unwrap_or_else(|| id.to_string())
 }
 
-/// Run the first-launch check. It reads the Keychain item at most once.
+/// "Saved your Claude Code login (a***@example.com) and ChatGPT login (b***@example.com)." Each part is left
+/// out when that login was not saved. Each name is the masked email, else the account id.
+pub fn saved_notice(claude: Option<&ClaudeImported>, chatgpt: Option<&CodexImported>) -> String {
+    let mut parts = Vec::new();
+    if let Some(c) = claude {
+        parts.push(format!("Claude Code login ({})", who(c.email.as_deref(), &c.id)));
+    }
+    if let Some(o) = chatgpt {
+        parts.push(format!("ChatGPT login ({})", who(o.login.email.as_deref(), &o.id)));
+    }
+    format!("Saved your {}.", parts.join(" and "))
+}
+
+fn import_claude(env: &Env, claude: &ClaudeCode) -> Result<ClaudeImported, String> {
+    claude
+        .login_source(env, LIVE_SERVICE, None)
+        .and_then(|source| claude.import_login(env, &source, None, None, false))
+        .map_err(|e| format!("no Claude Code login was saved on the first launch: {e}"))
+}
+
+/// Reads `auth.json` from the live Codex home (`~/.codex`), the file the ChatGPT app and the Codex CLI share.
+fn import_chatgpt(env: &Env) -> Result<CodexImported, String> {
+    let homes = Homes::new(env.paths);
+    let copy = codex::read_copy(&homes.primary, "~/.codex")
+        .map_err(|e| format!("no ChatGPT login was saved on the first launch: {e}"))?
+        .ok_or_else(|| "no ChatGPT login was saved on the first launch: ~/.codex has no auth.json".to_string())?;
+    codex::import(env, vec![copy], None, None, false).map_err(|e| format!("no ChatGPT login was saved on the first launch: {e}"))
+}
+
+/// Run the first-launch check. It reads the Keychain item and `auth.json` at most once.
 pub fn check(env: &Env, claude: &ClaudeCode) -> Outcome {
     match Config::create_if_absent(env.paths) {
         Ok(true) => {}
         Ok(false) => return Outcome::NotFirst,
         Err(e) => return Outcome::NothingSaved(format!("cannot record the first launch: {e}")),
     }
-    let imported = claude
-        .login_source(env, LIVE_SERVICE, None)
-        .and_then(|source| claude.import_login(env, &source, None, None, false));
-    match imported {
-        Ok(done) => Outcome::Saved(saved_notice(&done)),
-        Err(e) => Outcome::NothingSaved(format!("no Claude Code login was saved on the first launch: {e}")),
+    let claude = import_claude(env, claude);
+    let chatgpt = import_chatgpt(env);
+    if claude.is_err() && chatgpt.is_err() {
+        let why: Vec<String> = [claude.err(), chatgpt.err()].into_iter().flatten().collect();
+        return Outcome::NothingSaved(why.join("; "));
     }
+    let notice = saved_notice(claude.as_ref().ok(), chatgpt.as_ref().ok());
+    let skipped = [claude.err(), chatgpt.err()].into_iter().flatten().collect();
+    Outcome::Saved { notice, skipped }
 }
 
 #[cfg(test)]
@@ -57,6 +90,18 @@ mod tests {
     use agent_switch_core::vault::Vault;
 
     const USER: &str = "tester";
+
+    fn b64url(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+            for i in 0..=chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            }
+        }
+        out
+    }
 
     /// A profile endpoint that knows one account.
     struct OneProfile(Option<&'static str>);
@@ -103,6 +148,21 @@ mod tests {
             ClaudeCode::new(self.live.clone(), Arc::new(OneProfile(email)), Arc::new(|k| (k == "USER").then(|| USER.to_string())))
         }
 
+        /// Put a ChatGPT login in `~/.codex/auth.json` of the fake home. `email` goes into the id token.
+        fn codex_login(&self, email: Option<&str>, account_id: &str) {
+            let dir = self.paths.home().join(".codex");
+            std::fs::create_dir_all(&dir).unwrap();
+            let id_token = email.map(|e| {
+                let claims = format!(r#"{{"email":"{e}","https://api.openai.com/auth":{{"chatgpt_account_id":"{account_id}","chatgpt_plan_type":"plus"}}}}"#);
+                format!("{}.{}.c2ln", b64url(br#"{"alg":"none"}"#), b64url(claims.as_bytes()))
+            });
+            let id_token = id_token.map(|t| format!(r#""id_token":"{t}","#)).unwrap_or_default();
+            let text = format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{{id_token}"access_token":"acc","refresh_token":"rt-1","account_id":"{account_id}"}},"last_refresh":"2026-11-01T00:00:00Z"}}"#
+            );
+            std::fs::write(dir.join("auth.json"), text).unwrap();
+        }
+
         fn check(&self, email: Option<&'static str>) -> Outcome {
             check(&Env { paths: &self.paths, vault: &self.vault }, &self.claude(email))
         }
@@ -112,7 +172,7 @@ mod tests {
     fn the_first_launch_saves_the_login_and_names_the_masked_email() {
         let fx = Fx::new();
         fx.sign_in();
-        let Outcome::Saved(notice) = fx.check(Some("jane@example.com")) else { panic!("nothing was saved") };
+        let Outcome::Saved { notice, .. } = fx.check(Some("jane@example.com")) else { panic!("nothing was saved") };
         assert_eq!(notice, format!("Saved your Claude Code login ({}).", mask_email("jane@example.com")));
         assert!(!notice.contains("jane@"), "{notice}");
         let config = Config::load(&fx.paths).unwrap();
@@ -126,7 +186,7 @@ mod tests {
     fn the_notice_names_the_account_id_when_the_email_is_unknown() {
         let fx = Fx::new();
         fx.sign_in();
-        let Outcome::Saved(notice) = fx.check(None) else { panic!("nothing was saved") };
+        let Outcome::Saved { notice, .. } = fx.check(None) else { panic!("nothing was saved") };
         assert_eq!(notice, "Saved your Claude Code login (claude-uuid-f).");
     }
 
@@ -173,5 +233,96 @@ mod tests {
         std::fs::write(fx.paths.home().join(".config/agent-switch"), "").unwrap();
         let Outcome::NothingSaved(why) = fx.check(Some("jane@example.com")) else { panic!("expected nothing saved") };
         assert!(why.starts_with("cannot record the first launch"), "{why}");
+    }
+
+    fn saved(outcome: Outcome) -> (String, Vec<String>) {
+        match outcome {
+            Outcome::Saved { notice, skipped } => (notice, skipped),
+            other => panic!("expected a saved account, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chatgpt_login_alone_is_saved_with_a_masked_notice_and_no_binding() {
+        let fx = Fx::new();
+        fx.codex_login(Some("bob@example.com"), "acct-1");
+        let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
+        assert_eq!(notice, format!("Saved your ChatGPT login ({}).", mask_email("bob@example.com")));
+        assert!(!notice.contains("bob@"), "{notice}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].starts_with("no Claude Code login was saved on the first launch"), "{skipped:?}");
+        let config = Config::load(&fx.paths).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].provider, Provider::Openai);
+        assert_eq!(config.surfaces, Default::default(), "the import binds nothing");
+    }
+
+    #[test]
+    fn both_logins_are_saved_and_one_notice_names_both() {
+        let fx = Fx::new();
+        fx.sign_in();
+        fx.codex_login(Some("bob@example.com"), "acct-1");
+        let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
+        assert_eq!(
+            notice,
+            format!("Saved your Claude Code login ({}) and ChatGPT login ({}).", mask_email("jane@example.com"), mask_email("bob@example.com"))
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let config = Config::load(&fx.paths).unwrap();
+        let providers: Vec<_> = config.accounts.iter().map(|a| a.provider).collect();
+        assert_eq!(providers, vec![Provider::Claude, Provider::Openai]);
+        assert_eq!(config.surfaces, Default::default(), "the import binds nothing");
+    }
+
+    #[test]
+    fn the_chatgpt_notice_names_the_account_id_when_the_email_is_unknown() {
+        let fx = Fx::new();
+        fx.codex_login(None, "acct-1");
+        let (notice, _) = saved(fx.check(None));
+        let id = &Config::load(&fx.paths).unwrap().accounts[0].id;
+        assert_eq!(notice, format!("Saved your ChatGPT login ({id})."));
+    }
+
+    #[test]
+    fn a_missing_auth_file_does_not_stop_the_claude_login() {
+        let fx = Fx::new();
+        fx.sign_in();
+        let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
+        assert_eq!(notice, format!("Saved your Claude Code login ({}).", mask_email("jane@example.com")));
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].starts_with("no ChatGPT login was saved on the first launch"), "{skipped:?}");
+        assert!(skipped[0].contains("no auth.json"), "{skipped:?}");
+    }
+
+    #[test]
+    fn a_corrupt_auth_file_is_logged_and_the_claude_login_is_still_saved() {
+        let fx = Fx::new();
+        fx.sign_in();
+        std::fs::create_dir_all(fx.paths.home().join(".codex")).unwrap();
+        std::fs::write(fx.paths.home().join(".codex/auth.json"), "not json").unwrap();
+        let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
+        assert!(notice.starts_with("Saved your Claude Code login"), "{notice}");
+        assert!(!notice.contains("ChatGPT"), "{notice}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].starts_with("no ChatGPT login was saved on the first launch"), "{skipped:?}");
+        let config = Config::load(&fx.paths).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].provider, Provider::Claude);
+    }
+
+    #[test]
+    fn nothing_saved_names_both_reasons() {
+        let fx = Fx::new();
+        let Outcome::NothingSaved(why) = fx.check(None) else { panic!("expected nothing saved") };
+        assert!(why.contains("no Claude Code login") && why.contains("no ChatGPT login"), "{why}");
+    }
+
+    #[test]
+    fn the_chatgpt_login_is_read_once_so_a_later_sign_in_is_not_imported() {
+        let fx = Fx::new();
+        assert!(matches!(fx.check(None), Outcome::NothingSaved(_)));
+        fx.codex_login(Some("bob@example.com"), "acct-1");
+        assert_eq!(fx.check(None), Outcome::NotFirst);
+        assert!(Config::load(&fx.paths).unwrap().accounts.is_empty());
     }
 }
