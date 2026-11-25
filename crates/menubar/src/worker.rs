@@ -33,7 +33,7 @@ use agent_switch_core::{switch, Error, Result};
 
 use crate::add_account::{self, Flow};
 use crate::first_launch::{self, Outcome};
-use crate::menu::{label_of, provider_title, surface_name, Action};
+use crate::menu::{label_of, provider_title, surface_name, switch_target, Action};
 
 pub enum Cmd {
     Do(Action),
@@ -53,6 +53,9 @@ pub enum Report {
     Busy { kind: SurfaceKind, account: Option<String>, titles: String },
     /// Config or state may have changed.
     Changed,
+    /// The worker finished one action, whatever its outcome. `switch` names the Desktop switch the action was,
+    /// so the menu can stop showing it as in progress.
+    Done { switch: Option<(SurfaceKind, String)> },
     /// The thread ended; the text says why.
     Exited(String),
 }
@@ -198,6 +201,7 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
                 let wakes_watcher = matches!(action, Action::SetSurfaceAuto(_, true));
                 let forceable = forceable_kind(&action);
                 let confirmed = matches!(action, Action::LogOut(_));
+                let switch = switch_target(&action);
                 let outcome = catch_unwind(AssertUnwindSafe(|| job.handle(action)));
                 match outcome {
                     Ok(Ok(Some(body))) => report(Report::Notice { title: "agent-switch".into(), body, dialog: confirmed, failure: false }),
@@ -216,6 +220,7 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
                 if wakes_watcher {
                     next_tick = 0;
                 }
+                report(Report::Done { switch });
                 report(Report::Changed);
             }
             Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break "stopped".to_string(),

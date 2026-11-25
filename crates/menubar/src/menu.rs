@@ -220,6 +220,27 @@ pub struct ForceOffer {
     pub since: u64,
 }
 
+/// How long the menu keeps showing a Desktop switch that the worker has not reported finished. It only
+/// guards against a lost completion signal; a switch takes seconds to a minute.
+pub const SWITCHING_SECS: u64 = 120;
+
+/// A Desktop switch the worker is carrying out: the menu already shows `account` as the app's account.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSwitch {
+    pub kind: SurfaceKind,
+    pub account: String,
+    /// When the click was dispatched (unix seconds).
+    pub since: u64,
+}
+
+/// The Desktop switch that `action` starts, if it is one that targets an account.
+pub fn switch_target(action: &Action) -> Option<(SurfaceKind, String)> {
+    match action {
+        Action::SwitchApp(kind, id) | Action::ForceRelaunch { kind, account: Some(id), .. } if kind.is_desktop() => Some((*kind, id.clone())),
+        _ => None,
+    }
+}
+
 /// What the menu needs besides the config and the state.
 pub struct Ctx {
     pub now: u64,
@@ -228,6 +249,8 @@ pub struct Ctx {
     pub watcher_running: bool,
     /// A refused busy switch that the user may force; ignored once it is older than `FORCE_OFFER_SECS`.
     pub force_offer: Option<ForceOffer>,
+    /// A Desktop switch in progress; ignored once it is older than `SWITCHING_SECS`.
+    pub switching: Option<PendingSwitch>,
     /// Accounts that have a registered Claude Desktop profile, or that the app's own folder is signed in as
     /// (the switch registers it). Without either, "Use for Desktop" cannot work.
     pub desktop_profiles: HashSet<String>,
@@ -500,6 +523,11 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
         out.push(Entry::item(format!("Switch anyway (ends: {titles})"), Action::ForceRelaunch { kind: offer.kind, account: offer.account.clone(), titles: offer.titles.clone() }));
         out.push(Entry::Separator);
     }
+    let switching = ctx.switching.as_ref().filter(|p| ctx.now.saturating_sub(p.since) < SWITCHING_SECS);
+    if let Some(p) = switching {
+        out.push(Entry::disabled(format!("Switching {} to {}…", surface_name(p.kind), label_of(config, &p.account))));
+        out.push(Entry::Separator);
+    }
     if !ctx.watcher_running {
         out.push(Entry::Label("The watcher stopped; quit and open agent-switch again".into()));
         out.push(Entry::Separator);
@@ -515,7 +543,11 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
         }
         any = true;
         let cli_current = policy::current_account(config, state, cli);
-        let app_current = app.and_then(|app| policy::current_account(config, state, app));
+        // A switch in progress shows its target right away; the real state catches up when it ends.
+        let app_current = app.and_then(|app| match switching {
+            Some(p) if p.kind == app => Some(p.account.clone()),
+            _ => policy::current_account(config, state, app),
+        });
         let currents = (cli_current.as_deref(), app_current.as_deref());
         out.push(provider_entry(config, provider, currents));
         for account in accounts {
@@ -689,7 +721,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, force_offer: None, desktop_profiles: ["personal".to_string(), "team".to_string()].into() }
+        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, force_offer: None, switching: None, desktop_profiles: ["personal".to_string(), "team".to_string()].into() }
     }
 
     fn find_row<'a>(entries: &'a [Entry], name: &str) -> &'a AccountRow {
@@ -990,6 +1022,57 @@ Claude >
         assert!(should_rebuild(&build(&c, &s, &ctx()), &menu, false), "a new reading redraws the row");
     }
 
+
+    fn desktop_checked(menu: &[Entry], name: &str) -> (bool, bool) {
+        let row = find_row(menu, name);
+        let checked = row.children.iter().any(|e| matches!(e, Entry::Item { text, checked: Some(true), .. } if text.starts_with("Use for Desktop")));
+        (row.app, checked)
+    }
+
+    #[test]
+    fn a_switch_in_progress_shows_its_target_as_the_desktop_account() {
+        let c = config();
+        let plain = build(&c, &State::default(), &ctx());
+        assert_eq!(desktop_checked(&plain, "Team"), (true, true));
+        assert_eq!(desktop_checked(&plain, "Personal"), (false, false));
+        assert!(!to_text(&plain).contains("Switching"), "no switch, no line");
+
+        let pending = PendingSwitch { kind: SurfaceKind::ClaudeDesktop, account: "personal".into(), since: NOW };
+        let menu = build(&c, &State::default(), &Ctx { switching: Some(pending.clone()), ..ctx() });
+        assert_eq!(menu[0], Entry::disabled("Switching Claude Desktop to Personal…"));
+        assert_eq!(menu[1], Entry::Separator);
+        assert_eq!(desktop_checked(&menu, "Personal"), (true, true));
+        assert_eq!(desktop_checked(&menu, "Team"), (false, false));
+
+        // A lost completion signal cannot leave the menu stuck.
+        let late = build(&c, &State::default(), &Ctx { now: NOW + SWITCHING_SECS, switching: Some(pending), ..ctx() });
+        assert_eq!(late, plain);
+    }
+
+    #[test]
+    fn a_chatgpt_desktop_switch_moves_only_that_apps_account() {
+        let mut c = config();
+        c.add_account(account("oa2", Provider::Openai, "OpenAI Work")).unwrap();
+        c.bind(SurfaceKind::ChatgptDesktop, Binding::parse("oa")).unwrap();
+        let pending = PendingSwitch { kind: SurfaceKind::ChatgptDesktop, account: "oa2".into(), since: NOW };
+        let menu = build(&c, &State::default(), &Ctx { switching: Some(pending), ..ctx() });
+        assert_eq!(menu[0], Entry::disabled("Switching ChatGPT to OpenAI Work…"));
+        assert_eq!(desktop_checked(&menu, "OpenAI Work"), (true, true));
+        assert_eq!(desktop_checked(&menu, "OpenAI Personal"), (false, false));
+        assert_eq!(desktop_checked(&menu, "Team"), (true, true), "the Claude row is untouched");
+    }
+
+    #[test]
+    fn only_a_desktop_click_that_names_an_account_is_a_switch() {
+        let claude = SurfaceKind::ClaudeDesktop;
+        assert_eq!(switch_target(&Action::SwitchApp(claude, "a".into())), Some((claude, "a".into())));
+        assert_eq!(switch_target(&Action::SwitchApp(SurfaceKind::ChatgptDesktop, "a".into())), Some((SurfaceKind::ChatgptDesktop, "a".into())));
+        let forced = Action::ForceRelaunch { kind: claude, account: Some("a".into()), titles: "t".into() };
+        assert_eq!(switch_target(&forced), Some((claude, "a".into())));
+        assert_eq!(switch_target(&Action::ForceRelaunch { kind: claude, account: None, titles: "t".into() }), None);
+        assert_eq!(switch_target(&Action::RelaunchApp(claude)), None);
+        assert_eq!(switch_target(&Action::Bind(SurfaceKind::ClaudeCli, Binding::parse("a"))), None);
+    }
 
     #[test]
     fn busy_refusal_offers_switch_anyway() {

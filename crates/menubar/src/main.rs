@@ -29,7 +29,7 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::menu::{Action, Ctx, Entry, ForceOffer};
+use crate::menu::{Action, Ctx, Entry, ForceOffer, PendingSwitch};
 use crate::notify::{Note, Notifier};
 use crate::worker::{Handle, Report, StartError};
 
@@ -92,7 +92,7 @@ fn main() {
 }
 
 /// The menu for what is on disk now.
-fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceOffer>) -> Vec<Entry> {
+fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceOffer>, switching: Option<PendingSwitch>) -> Vec<Entry> {
     match (Config::load(paths), State::load(paths)) {
         (Ok(config), Ok(state)) => {
             let desktop_profiles = match claude_desktop::Registry::load(paths) {
@@ -107,11 +107,11 @@ fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceO
                     config.accounts.iter().map(|a| a.id.clone()).collect()
                 }
             };
-            let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer, desktop_profiles };
+            let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer, switching, desktop_profiles };
             menu::build(&config, &state, &ctx)
         }
         (Err(e), _) | (_, Err(e)) => {
-            let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer, desktop_profiles: Default::default() };
+            let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer, switching, desktop_profiles: Default::default() };
             menu::error_menu(&e.to_string(), &ctx)
         }
     }
@@ -120,7 +120,7 @@ fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceO
 fn print_menu() -> i32 {
     match Paths::from_env() {
         Ok(paths) => {
-            print!("{}", menu::to_text(&current_menu(&paths, true, None)));
+            print!("{}", menu::to_text(&current_menu(&paths, true, None, None)));
             0
         }
         Err(e) => {
@@ -175,7 +175,7 @@ fn run_app() -> i32 {
     }));
     spawn_ticker(proxy.clone());
 
-    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, pending_result: None, force_offer: None, watcher_running: true, counter: 0 };
+    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, pending_result: None, force_offer: None, switching: None, watcher_running: true, counter: 0 };
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
@@ -230,6 +230,9 @@ struct App {
     pending_result: Option<(String, String)>,
     /// A refused busy switch the menu can force; the menu drops it after `menu::FORCE_OFFER_SECS`.
     force_offer: Option<ForceOffer>,
+    /// The Desktop switch the worker is running; the menu shows its target as current until the worker
+    /// reports it done (or `menu::SWITCHING_SECS` pass).
+    switching: Option<PendingSwitch>,
     watcher_running: bool,
     counter: u64,
 }
@@ -264,7 +267,7 @@ impl App {
     /// Rebuild the menu when what it shows has changed, or when a click asked for it.
     fn refresh(&mut self) {
         self.show_pending_result();
-        let entries = current_menu(&self.paths, self.watcher_running, self.force_offer.clone());
+        let entries = current_menu(&self.paths, self.watcher_running, self.force_offer.clone(), self.switching.clone());
         if !menu::should_rebuild(&entries, &self.shown, self.force_rebuild) {
             return;
         }
@@ -321,6 +324,10 @@ impl App {
     /// Hand an action to the worker.
     fn confirmed(&mut self, action: Action) {
         if let Some(worker) = &self.worker {
+            if let Some((kind, account)) = menu::switch_target(&action) {
+                self.switching = Some(PendingSwitch { kind, account, since: now_secs() });
+                self.force_rebuild = true;
+            }
             worker.send(action);
         }
         self.refresh();
@@ -352,6 +359,14 @@ impl App {
                 self.force_rebuild = true;
             }
             Report::Changed => self.refresh(),
+            Report::Done { switch } => {
+                // Only the end of the switch that is shown clears it; a later click may have replaced it.
+                if switch.is_some() && self.switching.as_ref().map(|p| (p.kind, p.account.clone())) == switch {
+                    self.switching = None;
+                    self.force_rebuild = true;
+                }
+                self.refresh();
+            }
             Report::Exited(reason) => {
                 if reason != "stopped" {
                     log_line(&format!("the watcher thread ended: {reason}"));
