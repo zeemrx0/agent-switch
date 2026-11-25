@@ -96,7 +96,11 @@ fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceO
     match (Config::load(paths), State::load(paths)) {
         (Ok(config), Ok(state)) => {
             let desktop_profiles = match claude_desktop::Registry::load(paths) {
-                Ok(registry) => registry.profiles.into_keys().collect(),
+                Ok(registry) => {
+                    // An account that the app's own folder is signed in as needs no setup: the switch registers it.
+                    let adoptable = claude_desktop::manage::unregistered_default_owner(paths, &config, &registry).map(|a| a.id.clone());
+                    registry.profiles.into_keys().chain(adoptable).collect()
+                }
                 Err(e) => {
                     // Unreadable, so keep the plain "Use for Desktop" rows; that action reports the problem.
                     log_line(&format!("cannot read the Claude Desktop profiles: {e}"));

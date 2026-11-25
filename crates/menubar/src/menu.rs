@@ -228,7 +228,8 @@ pub struct Ctx {
     pub watcher_running: bool,
     /// A refused busy switch that the user may force; ignored once it is older than `FORCE_OFFER_SECS`.
     pub force_offer: Option<ForceOffer>,
-    /// Accounts that have a registered Claude Desktop profile. Without one, "Use for Desktop" cannot work.
+    /// Accounts that have a registered Claude Desktop profile, or that the app's own folder is signed in as
+    /// (the switch registers it). Without either, "Use for Desktop" cannot work.
     pub desktop_profiles: HashSet<String>,
 }
 

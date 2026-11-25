@@ -39,7 +39,40 @@ pub struct AddReport {
     pub notes: Vec<String>,
     /// Claude was opened on the new profile and waits for a sign-in.
     pub opened_for_sign_in: bool,
+    /// The app's own folder holds another account's sessions, so it was registered in place for that
+    /// account first (or, in a dry run, would be). Later switches then mirror the sessions between the two.
+    pub default_registered_for: Option<String>,
     pub session: Option<Session>,
+}
+
+/// The claude account that the app's own folder is signed in as, when neither the folder nor the account
+/// has a registered profile. Such a folder holds that account's local sessions and can be registered in
+/// place for it without any sign-in.
+pub fn unregistered_default_owner<'a>(paths: &Paths, config: &'a Config, registry: &Registry) -> Option<&'a Account> {
+    let default = default_profile(paths);
+    if registry.entry_for_dir(&default).is_some() {
+        return None;
+    }
+    let uuid = profile_uuid(&default).ok().flatten()?;
+    config
+        .accounts
+        .iter()
+        .find(|a| a.provider == Provider::Claude && a.uuid.as_deref() == Some(uuid.as_str()))
+        .filter(|a| !registry.profiles.contains_key(&a.id))
+}
+
+/// Register the app's own folder in place for `id` when it is signed in as that account and nothing else
+/// owns it yet (see `unregistered_default_owner`). Returns whether it did. This is what lets "Use for
+/// Desktop" work on an account that signed in to Desktop before agent-switch.
+pub fn adopt_default_folder(env: &Env, sys: &dyn System, id: &str) -> Result<bool> {
+    let config = Config::load(env.paths)?;
+    let registry = Registry::load(env.paths)?;
+    if unregistered_default_owner(env.paths, &config, &registry).is_none_or(|a| a.id != id) {
+        return Ok(false);
+    }
+    let default = default_profile(env.paths);
+    add_profile(env, sys, &AddRequest { account: id, from_profile: Some(&default), dry_run: false })?;
+    Ok(true)
 }
 
 fn running_error(sys: &dyn System, paths: &Paths) -> Result<Option<Error>> {
@@ -124,6 +157,7 @@ pub fn add_profile(env: &Env, sys: &dyn System, req: &AddRequest) -> Result<AddR
         runtime: None,
         notes: Vec::new(),
         opened_for_sign_in: false,
+        default_registered_for: None,
         session: None,
     };
 
@@ -147,7 +181,7 @@ pub fn add_profile(env: &Env, sys: &dyn System, req: &AddRequest) -> Result<AddR
     match req.from_profile {
         Some(src) if same_dir(src, &default) => register_in_place(env, account, &default, req.dry_run, &mut report)?,
         Some(src) => clone_existing(env, sys, account, src, req.dry_run, &mut report)?,
-        None => create_new(env, sys, account, &default, req.dry_run, &mut report)?,
+        None => create_new(env, sys, &config, account, &default, req.dry_run, &mut report)?,
     }
     Ok(report)
 }
@@ -159,9 +193,18 @@ fn register_in_place(env: &Env, account: &Account, default: &Path, dry_run: bool
     report.dir = dir.clone();
     report.in_place = true;
     if !dry_run {
-        register(env.paths, &account.id, ProfileEntry { dir, protected: true, from: None })?;
+        register_default(env.paths, &account.id, dir)?;
     }
     Ok(())
+}
+
+/// Record the app's own folder as the protected profile of `id`. The session mirror knew the folder as
+/// `default` until now, so its records move to `id`; without that, `mirror_off` would not find the sessions
+/// whose origin is this folder.
+fn register_default(paths: &Paths, id: &str, dir: PathBuf) -> Result<()> {
+    register(paths, id, ProfileEntry { dir, protected: true, from: None })?;
+    session_mirror::rename_profile(paths, "default", id)
+        .map_err(|e| Error::Invalid(format!("`{id}` was registered, but its session-mirror record could not be renamed from `default`: {e}")))
 }
 
 /// A profile that is already signed in elsewhere (for example `~/.agent-switch/tmp/desktop-b`): clone the
@@ -203,7 +246,7 @@ fn clone_existing(env: &Env, sys: &dyn System, account: &Account, src: &Path, dr
 
 /// A fresh profile: private folder, the MCP config copied as is, the runtime cloned, then Claude opened on it
 /// for the sign-in.
-fn create_new(env: &Env, sys: &dyn System, account: &Account, default: &Path, dry_run: bool, report: &mut AddReport) -> Result<()> {
+fn create_new(env: &Env, sys: &dyn System, config: &Config, account: &Account, default: &Path, dry_run: bool, report: &mut AddReport) -> Result<()> {
     if account.uuid.is_some() && profile_uuid(default).ok().flatten() == account.uuid {
         return Err(Error::Invalid(format!(
             "the app's own profile {} already holds `{}`; register it instead: \
@@ -224,6 +267,14 @@ fn create_new(env: &Env, sys: &dyn System, account: &Account, default: &Path, dr
             report.notes.push(format!("would refuse: {e}"));
         } else {
             return Err(e);
+        }
+    }
+    // The app's own folder may hold another account's sessions. Register it for that account first, so the
+    // switches between the two accounts mirror them.
+    if let Some(owner) = unregistered_default_owner(env.paths, config, &Registry::load(env.paths)?) {
+        report.default_registered_for = Some(owner.id.clone());
+        if !dry_run {
+            register_default(env.paths, &owner.id, canon(default))?;
         }
     }
     if dry_run {

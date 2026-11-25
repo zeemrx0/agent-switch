@@ -306,6 +306,9 @@ impl Job<'_> {
     /// went through makes `id` the surface's first priority, so a rollback has no priority to restore.
     fn switch_to(&self, kind: SurfaceKind, id: &str, force: Option<&str>) -> Result<Option<String>> {
         let paths = self.env.paths;
+        if kind == SurfaceKind::ClaudeDesktop {
+            claude_desktop::manage::adopt_default_folder(self.env, &SystemApps, id)?;
+        }
         let previous = Config::load(paths)?.surfaces.get(kind).clone();
         let config = switch::bind(paths, kind, Binding::Account(id.to_string()))?;
         let label = label_of(&config, id);

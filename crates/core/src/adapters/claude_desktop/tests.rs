@@ -244,6 +244,52 @@ fn a_new_profile_gets_the_config_as_is_the_runtime_and_a_sign_in_window() {
 }
 
 #[test]
+fn a_new_profile_registers_the_default_folder_for_the_account_it_holds() {
+    let fx = Fx::new();
+    fx.default_with_runtime(); // signed in as personal, not registered
+    let sys = Rc::new(FakeSystem::new(true));
+    let dry = add_profile(&fx.env(), sys.as_ref(), &req("team", None, true)).unwrap();
+    assert_eq!(dry.default_registered_for.as_deref(), Some("personal"));
+    assert!(Registry::load(&fx.paths).unwrap().profiles.is_empty(), "a dry run registers nothing");
+
+    let report = add_profile(&fx.env(), sys.as_ref(), &req("team", None, false)).unwrap();
+    assert_eq!(report.default_registered_for.as_deref(), Some("personal"));
+    let reg = Registry::load(&fx.paths).unwrap();
+    assert_eq!(reg.profiles["personal"], ProfileEntry { dir: canon(&fx.default()), protected: true, from: None });
+    assert!(reg.profiles.contains_key("team"));
+    assert_eq!(profile_uuid(&fx.default()).unwrap().as_deref(), Some(U_PERSONAL), "the folder is untouched");
+}
+
+#[test]
+fn a_new_profile_leaves_a_default_folder_of_an_unknown_account_alone() {
+    let fx = Fx::new();
+    make_profile(&fx.default(), Some("99999999-cccc-4ccc-8ccc-999999999999"), Some(future()));
+    let sys = Rc::new(FakeSystem::new(true));
+    let report = add_profile(&fx.env(), sys.as_ref(), &req("team", None, false)).unwrap();
+    assert_eq!(report.default_registered_for, None);
+    let reg = Registry::load(&fx.paths).unwrap();
+    assert_eq!(reg.profiles.keys().collect::<Vec<_>>(), vec!["team"]);
+}
+
+#[test]
+fn the_signed_in_default_folder_is_adopted_for_its_account_only() {
+    let fx = Fx::new();
+    fx.default_with_runtime();
+    let sys = Rc::new(FakeSystem::new(true));
+    let config = Config::load(&fx.paths).unwrap();
+    let owner = unregistered_default_owner(&fx.paths, &config, &Registry::load(&fx.paths).unwrap());
+    assert_eq!(owner.map(|a| a.id.as_str()), Some("personal"));
+
+    assert!(!adopt_default_folder(&fx.env(), sys.as_ref(), "team").unwrap(), "another account does not adopt it");
+    assert!(Registry::load(&fx.paths).unwrap().profiles.is_empty());
+    assert!(adopt_default_folder(&fx.env(), sys.as_ref(), "personal").unwrap());
+    let reg = Registry::load(&fx.paths).unwrap();
+    assert_eq!(reg.profiles["personal"], ProfileEntry { dir: canon(&fx.default()), protected: true, from: None });
+    assert!(unregistered_default_owner(&fx.paths, &config, &reg).is_none(), "once registered it has no unregistered owner");
+    assert!(!adopt_default_folder(&fx.env(), sys.as_ref(), "personal").unwrap());
+}
+
+#[test]
 fn add_refuses_while_claude_runs_and_names_the_processes() {
     let fx = Fx::new();
     fx.default_with_runtime();
@@ -1175,6 +1221,34 @@ fn mirror_off_stays_off_on_next_sync() {
     session_mirror::mirror_on(&fx.paths).unwrap();
     switch::activate(&fx.env(), &config, &a, "team").unwrap();
     assert!(has_session(&team, U_TEAM, S1) && has_session(&fx.default(), U_PERSONAL, S2));
+}
+
+#[test]
+fn registering_the_default_folder_moves_its_mirror_records_so_mirror_off_restores_them() {
+    let fx = Fx::new();
+    fx.default_with_runtime(); // signed in as personal, not registered: the mirror calls it `default`
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    let team = fx.team_profile();
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let mut config = Config::load(&fx.paths).unwrap();
+    config.bind(SurfaceKind::ClaudeDesktop, Binding::parse("team")).unwrap();
+    config.save(&fx.paths).unwrap();
+    let sys = Rc::new(FakeSystem::new(true));
+    let a = fx.adapter(&sys);
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(has_session(&team, U_TEAM, S1) && has_session(&fx.default(), U_PERSONAL, S2));
+    let manifest = || session_mirror::Manifest::load(&session_mirror::Manifest::file(&fx.paths)).unwrap();
+    assert_eq!(manifest().sessions[S1].origin, "default");
+
+    assert!(adopt_default_folder(&fx.env(), sys.as_ref(), "personal").unwrap());
+    let after = manifest();
+    assert_eq!(after.sessions[S1].origin, "personal");
+    assert!(after.sessions[S1].copies.contains_key("personal") && !after.sessions[S1].copies.contains_key("default"));
+    assert!(after.profiles.contains_key("personal") && !after.profiles.contains_key("default"));
+
+    session_mirror::mirror_off(&fx.paths, sys.as_ref()).unwrap();
+    assert!(has_session(&fx.default(), U_PERSONAL, S1) && !has_session(&fx.default(), U_PERSONAL, S2));
+    assert!(has_session(&team, U_TEAM, S2) && !has_session(&team, U_TEAM, S1), "the mirrored copy leaves the other profile");
 }
 
 #[test]

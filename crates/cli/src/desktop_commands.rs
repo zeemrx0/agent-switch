@@ -50,6 +50,9 @@ pub fn add(opts: &AddOptions) -> Result<i32> {
     if let Some(s) = &report.session {
         println!("  session: {}", s.describe());
     }
+    if let Some(owner) = &report.default_registered_for {
+        println!("  {} the app's own profile as `{owner}` (in place, protected) so its sessions are mirrored to `{id}`", if report.dry_run { "would also register" } else { "also registered" });
+    }
     if report.config_copied {
         println!("  copied claude_desktop_config.json as is (mode 0600)");
         if !report.mcp_env_keys.is_empty() {
