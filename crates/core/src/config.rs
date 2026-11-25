@@ -380,6 +380,22 @@ impl Config {
         Ok(config)
     }
 
+    /// Create an empty config file unless it exists. An empty file loads as the defaults, so nothing is
+    /// frozen into it and an interrupted call cannot leave half a file. Returns whether this call created
+    /// it, so of two processes that race for a first start only one gets `true`.
+    pub fn create_if_absent(paths: &Paths) -> Result<bool> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = paths.config_file();
+        if let Some(dir) = file.parent() {
+            ensure_private_dir(dir)?;
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(Error::io(format!("create {}", file.display()), e)),
+        }
+    }
+
     pub fn save(&self, paths: &Paths) -> Result<()> {
         self.validate()?;
         let file = paths.config_file();
@@ -552,6 +568,38 @@ mod tests {
         c.add_account(acct("personal", Provider::Claude)).unwrap();
         c.add_account(acct("work-gpt", Provider::Openai)).unwrap();
         c
+    }
+
+    #[test]
+    fn create_if_absent_creates_an_empty_private_config_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        assert!(Config::create_if_absent(&paths).unwrap());
+        assert_eq!(std::fs::metadata(paths.config_file()).unwrap().len(), 0, "the file is empty");
+        assert_eq!(Config::load(&paths).unwrap(), Config::default());
+        assert_eq!(std::fs::metadata(paths.config_file()).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!Config::create_if_absent(&paths).unwrap(), "the second call finds the file");
+    }
+
+    #[test]
+    fn create_if_absent_keeps_an_existing_config() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        sample().save(&paths).unwrap();
+        assert!(!Config::create_if_absent(&paths).unwrap());
+        assert_eq!(Config::load(&paths).unwrap(), sample());
+    }
+
+    #[test]
+    fn only_one_of_many_racing_callers_creates_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        let created = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| Config::create_if_absent(&paths).unwrap())).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).filter(|c| *c).count()
+        });
+        assert_eq!(created, 1);
     }
 
     #[test]

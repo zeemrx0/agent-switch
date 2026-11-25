@@ -8,6 +8,7 @@
 mod account_row;
 mod add_account;
 mod confirm;
+mod first_launch;
 mod icon;
 mod login_item;
 mod menu;

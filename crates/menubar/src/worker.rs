@@ -16,6 +16,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use agent_switch_core::adapters::chatgpt_desktop::ChatgptDesktop;
+use agent_switch_core::adapters::claude_code::ClaudeCode;
 use agent_switch_core::adapters::claude_desktop::manage::{RemovePlan, REFUSAL_LINK_ON, REFUSAL_LINK_POINTS, REFUSAL_RUNNING};
 use agent_switch_core::adapters::claude_desktop::{self, ClaudeDesktop};
 use agent_switch_core::adapters::surface_for;
@@ -31,6 +32,7 @@ use agent_switch_core::watcher::{Event, Relaunch, Watcher};
 use agent_switch_core::{switch, Error, Result};
 
 use crate::add_account::{self, Flow};
+use crate::first_launch::{self, Outcome};
 use crate::menu::{label_of, provider_title, surface_name, Action};
 
 pub enum Cmd {
@@ -162,6 +164,16 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
         watcher.on_event(move |e| report(Report::Event(e.clone())));
     }
     let _ = ready.send(Ok(()));
+
+    // Only the copy that holds the watcher lock gets here, so a second copy never takes the first launch.
+    match first_launch::check(&env, &ClaudeCode::production()) {
+        Outcome::NotFirst => {}
+        Outcome::NothingSaved(why) => crate::log_line(&why),
+        Outcome::Saved(body) => {
+            report(Report::Notice { title: "agent-switch".into(), body, dialog: false });
+            report(Report::Changed);
+        }
+    }
 
     let mut job = Job { env: &env, consent: &consent, watcher };
     let mut next_tick = 0u64;

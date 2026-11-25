@@ -69,6 +69,10 @@ This needs no certificate. It needs a Rust toolchain (`rustup`) and the Xcode co
 
 Open the app with `open "$HOME/Applications/Agent Switch.app"` and answer the notification prompt. Quit it from its menu before you reinstall.
 
+### First launch
+
+The first time the app starts, it saves the login that Claude Code already holds, as if you had chosen "Save current Claude Code login". "First time" means that `~/.config/agent-switch/config.toml` does not exist yet. The app creates that file at once, so the check runs only once. If Claude Code is not signed in or the save fails, nothing is shown and the reason goes to `~/Library/Logs/agent-switch/menubar.log`. If it works, the menu says "Saved your Claude Code login (...)." and lists the account. It binds no surface. It does not read Claude Desktop, ChatGPT, Codex or Antigravity: save those from the "Add account" menu. macOS may ask once to let the app read the "Claude Code-credentials" Keychain item. If the login was not saved (for example, you did not answer that prompt in time), choose **Add account > Save current Claude Code login**.
+
 ### Shell setup
 
 Add to `~/.zshrc` so a new terminal points the Codex CLI at its own login:
