@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_switch_core::adapters::claude_desktop;
+use agent_switch_core::adapters::claude_desktop::{self, manage::RemovePlan};
 use agent_switch_core::config::{mask_email, Binding, Config, SurfaceKind};
 use agent_switch_core::doctor::{self, DoctorInput, Level};
 use agent_switch_core::macos_apps::SystemApps;
@@ -154,13 +154,20 @@ pub fn remove(account: &str) -> Result<Code> {
         println!("removed the recovery copy {account}");
         return Ok(0);
     }
-    // A protected Claude Desktop folder (the original data) stops the removal before anything is deleted.
+    // A Desktop profile in use (or the original folder while default-link is on) stops the removal before
+    // anything is deleted.
     let profile = claude_desktop::manage::plan_remove(&app.paths, &SystemApps, account)?;
     let removed = switch::remove_account(&app.paths, &app.vault, account)?;
     println!("removed {} ({}): config entry and saved login deleted", removed.id, removed.provider);
-    if let Some(entry) = profile {
-        claude_desktop::manage::finish_remove(&app.paths, account, &entry)?;
-        println!("claude-desktop: deleted the profile folder {}", entry.dir.display());
+    if let Some(plan) = profile {
+        claude_desktop::manage::finish_remove(&app.paths, account, &plan)?;
+        match plan {
+            RemovePlan::Delete(entry) => println!("claude-desktop: deleted the profile folder {}", entry.dir.display()),
+            RemovePlan::Release(entry) => println!(
+                "claude-desktop: kept Claude Desktop's own folder {} (no longer linked to `{account}`; agent-switch never deletes it). It stays signed in until you sign out inside Claude",
+                entry.dir.display()
+            ),
+        }
     }
     Ok(0)
 }

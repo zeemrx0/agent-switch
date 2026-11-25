@@ -89,6 +89,27 @@ impl Default for Manifest {
 }
 
 impl Manifest {
+    /// Call the profile `from` by the id `to` everywhere: its synced folder, each session's origin and each
+    /// session's copy record. A record already under `to` is replaced. `false` when `from` appears nowhere.
+    fn rename_profile(&mut self, from: &str, to: &str) -> bool {
+        let mut changed = false;
+        if let Some(folder) = self.profiles.remove(from) {
+            self.profiles.insert(to.to_string(), folder);
+            changed = true;
+        }
+        for entry in self.sessions.values_mut() {
+            if entry.origin == from {
+                entry.origin = to.to_string();
+                changed = true;
+            }
+            if let Some(copy) = entry.copies.remove(from) {
+                entry.copies.insert(to.to_string(), copy);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn file(paths: &Paths) -> PathBuf {
         profiles_root(paths).join("session-mirror.json")
     }
@@ -868,6 +889,18 @@ pub fn mirror_off(paths: &Paths, sys: &dyn System) -> Result<Outcome> {
     let mut notes = notes;
     notes.extend(plan.notes);
     Ok(outcome(stats, notes))
+}
+
+/// Rename a profile in the manifest, under the manifest lock. Writes nothing when there is no manifest or the
+/// profile is not in it.
+pub fn rename_profile(paths: &Paths, from: &str, to: &str) -> Result<()> {
+    let _lock = lock(paths)?;
+    let file = Manifest::file(paths);
+    let mut manifest = Manifest::load(&file)?;
+    if manifest.rename_profile(from, to) {
+        manifest.save(&file)?;
+    }
+    Ok(())
 }
 
 /// Switch mirroring on again after `mirror_off`. The next switch starts from the sessions each profile has.

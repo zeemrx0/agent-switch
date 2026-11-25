@@ -472,6 +472,17 @@ fn footer(config: &Config, ctx: &Ctx) -> Vec<Entry> {
     vec![Entry::Submenu { text: "Settings".into(), entries: settings }, Entry::item("Quit", Action::Quit)]
 }
 
+/// The detail of the Log out dialog. `keeps_folder` is true for the account that owns Claude Desktop's own
+/// data folder, which a log out leaves in place.
+pub fn log_out_detail(label: &str, keeps_folder: bool) -> String {
+    let base = "Its saved login is deleted from agent-switch, and surfaces that use it become unmanaged. The login that Claude, Codex or agy holds is not touched.";
+    if keeps_folder {
+        format!("{base} Claude Desktop's own data folder is kept, and it stays signed in as {label} until you sign out inside Claude.")
+    } else {
+        base.to_string()
+    }
+}
+
 /// The whole menu.
 pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     let mut out = Vec::new();
@@ -1049,6 +1060,25 @@ Claude >
         let with = build(&c, &State::default(), &Ctx { notice: Some("Claude Desktop now uses Team\nsecond line".into()), ..ctx() });
         assert_eq!(with[0], Entry::Label("Last: Claude Desktop now uses Team second line".into()));
         assert!(!to_text(&build(&c, &State::default(), &ctx())).contains("Last:"));
+    }
+
+    #[test]
+    fn a_long_log_out_refusal_keeps_its_verdict_in_the_notice_line() {
+        let reason = "Claude's default folder is linked to Personal's data (default-link is on). Run `agent-switch default-link disable` in Terminal, then log out Personal again.";
+        let notice = format!("Personal was not logged out: {reason}");
+        assert!(notice.chars().count() > MAX_NOTICE_CHARS);
+        let menu = build(&config(), &State::default(), &Ctx { notice: Some(notice), ..ctx() });
+        let Entry::Label(line) = &menu[0] else { panic!("no notice line in\n{}", to_text(&menu)) };
+        assert!(line.starts_with("Last: Personal was not logged out: Claude's default folder"), "{line}");
+        assert!(line.ends_with('…') && line.chars().count() <= "Last: ".len() + MAX_NOTICE_CHARS);
+    }
+
+    #[test]
+    fn the_log_out_dialog_says_when_claude_desktops_own_folder_is_kept() {
+        let plain = log_out_detail("Team", false);
+        assert!(!plain.contains("data folder"), "{plain}");
+        let kept = log_out_detail("Personal", true);
+        assert!(kept.starts_with(&plain) && kept.contains("Claude Desktop's own data folder is kept") && kept.contains("signed in as Personal until you sign out inside Claude"), "{kept}");
     }
 
     #[test]

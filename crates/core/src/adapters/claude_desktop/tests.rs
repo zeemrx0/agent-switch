@@ -367,23 +367,130 @@ fn two_accounts_cannot_share_one_folder() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn remove_refuses_the_protected_folder_and_deletes_a_managed_one() {
+fn removing_the_original_folder_releases_it_and_deletes_a_managed_one() {
     let fx = Fx::new();
     fx.default_with_runtime();
     fx.register("personal", &fx.default(), true);
+    let before = tree_stats(&fx.default()).unwrap();
+    let config_before = fs::read(fx.default().join("config.json")).unwrap();
     let sys = FakeSystem::new(true);
-    let err = plan_remove(&fx.paths, &sys, "personal").unwrap_err().to_string();
-    assert!(err.contains("protected") && err.contains("never deletes"), "{err}");
-    // Even a forged call to the deleter refuses it.
-    let entry = Registry::load(&fx.paths).unwrap().profiles["personal"].clone();
-    assert!(finish_remove(&fx.paths, "personal", &entry).is_err());
+    sys.add(5, MAIN); // nothing moves, so a running Claude is no obstacle
+
+    let plan = plan_remove(&fx.paths, &sys, "personal").unwrap().unwrap();
+    let RemovePlan::Release(entry) = &plan else { panic!("expected a release, got {plan:?}") };
+    assert!(entry.protected && entry.dir == fx.default());
+    finish_remove(&fx.paths, "personal", &plan).unwrap();
+    assert!(!Registry::load(&fx.paths).unwrap().profiles.contains_key("personal"));
+    assert_eq!(tree_stats(&fx.default()).unwrap(), before, "the original folder is untouched");
+    assert_eq!(fs::read(fx.default().join("config.json")).unwrap(), config_before);
+
+    // Even a forged delete of a protected entry is refused.
+    assert!(finish_remove(&fx.paths, "personal", &RemovePlan::Delete(entry.clone())).is_err());
     assert!(fx.default().join("config.json").exists());
 
     let team = fx.team_profile();
     assert_eq!(plan_remove(&fx.paths, &sys, "ghost").unwrap(), None);
     let planned = plan_remove(&fx.paths, &sys, "team").unwrap().unwrap();
+    assert!(matches!(planned, RemovePlan::Delete(_)));
     finish_remove(&fx.paths, "team", &planned).unwrap();
     assert!(!team.exists() && !Registry::load(&fx.paths).unwrap().profiles.contains_key("team"));
+}
+
+#[test]
+fn removing_the_original_folder_is_refused_while_the_default_link_is_on() {
+    let fx = Fx::new();
+    // Link mode: the original lives in the managed folder and the default folder is a symlink to it.
+    let original = fx.root().join("personal");
+    make_profile(&original, Some(U_PERSONAL), Some(future()));
+    fx.register("personal", &original, true);
+    Registry::update(&fx.paths, |r| {
+        r.link = true;
+        Ok(())
+    })
+    .unwrap();
+    let sys = FakeSystem::new(true);
+    let err = plan_remove(&fx.paths, &sys, "personal").unwrap_err().to_string();
+    assert!(err.contains(REFUSAL_LINK_ON) && err.contains("default-link disable"), "{err}");
+    assert!(!releases_original_folder(&fx.paths, "personal"));
+
+    // A forged release changes nothing either.
+    let entry = Registry::load(&fx.paths).unwrap().profiles["personal"].clone();
+    assert!(finish_remove(&fx.paths, "personal", &RemovePlan::Release(entry)).is_err());
+    assert!(Registry::load(&fx.paths).unwrap().profiles.contains_key("personal"));
+    assert!(original.join("config.json").exists());
+}
+
+#[test]
+fn a_protected_entry_whose_account_is_gone_does_not_block_registering_the_folder_again() {
+    let fx = Fx::new();
+    fx.default_with_runtime();
+    fx.register("personal", &fx.default(), true);
+    let entry = || ProfileEntry { dir: fx.default(), protected: true, from: None };
+    // The account still exists: the folder stays taken.
+    assert!(register(&fx.paths, "team", entry()).is_err());
+    // The account is gone, as after a release that stopped halfway: the orphan entry gives way.
+    Config::update(&fx.paths, |c| c.remove_account("personal").map(|_| ())).unwrap();
+    register(&fx.paths, "team", entry()).unwrap();
+    let profiles = Registry::load(&fx.paths).unwrap().profiles;
+    assert!(!profiles.contains_key("personal") && profiles["team"].dir == fx.default());
+    assert!(fx.default().join("config.json").exists());
+}
+
+fn mirror_entry(origin: &str, copies: &[(&str, &str)]) -> session_mirror::Entry {
+    let copies = copies.iter().map(|(p, h)| (p.to_string(), session_mirror::CopyState { hash: h.to_string(), present: true })).collect();
+    session_mirror::Entry { origin: origin.into(), copies, deleted: false }
+}
+
+fn mirror_state(id: &str, folder: &str, sessions: &[(&str, &str)]) -> session_mirror::ProfileState {
+    let seen = sessions
+        .iter()
+        .map(|(s, h)| (s.to_string(), session_mirror::Seen { hash: h.to_string(), key: (1, 1, 1), born: None }))
+        .collect();
+    session_mirror::ProfileState { id: id.into(), folder: folder.into(), seen, blocked: Default::default() }
+}
+
+#[test]
+fn releasing_the_original_folder_renames_its_mirror_record_to_default() {
+    let fx = Fx::new();
+    fx.default_with_runtime();
+    fx.register("personal", &fx.default(), true);
+    let manifest = session_mirror::Manifest {
+        version: 1,
+        enabled: true,
+        profiles: [("personal".to_string(), "acct/org".to_string()), ("team".to_string(), "acct2/org2".to_string())].into(),
+        sessions: [
+            ("local_a".to_string(), mirror_entry("personal", &[("personal", "h1"), ("team", "h1")])),
+            ("local_b".to_string(), mirror_entry("team", &[("personal", "h2"), ("team", "h2")])),
+        ]
+        .into(),
+    };
+    let file = session_mirror::Manifest::file(&fx.paths);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+    let sys = FakeSystem::new(true);
+    let plan = plan_remove(&fx.paths, &sys, "personal").unwrap().unwrap();
+    finish_remove(&fx.paths, "personal", &plan).unwrap();
+
+    let after = session_mirror::Manifest::load(&file).unwrap();
+    assert_eq!(after.profiles.keys().collect::<Vec<_>>(), ["default", "team"]);
+    assert_eq!(after.profiles["default"], "acct/org");
+    assert_eq!(after.sessions["local_a"].origin, "default");
+    assert!(after.sessions.values().all(|e| !e.copies.contains_key("personal") && e.copies.contains_key("default")));
+
+    // The next sync sees the same folder under its new id and finds nothing to do.
+    let states = [mirror_state("default", "acct/org", &[("local_a", "h1"), ("local_b", "h2")]), mirror_state("team", "acct2/org2", &[("local_a", "h1"), ("local_b", "h2")])];
+    let next = session_mirror::plan(&after, &states, Some("default"));
+    assert!(next.writes.is_empty() && next.backups.is_empty() && next.moves.is_empty(), "{next:?}");
+    assert_eq!(next.manifest.as_ref().unwrap().sessions, after.sessions);
+
+    // Releasing with no manifest at all writes none.
+    let fx = Fx::new();
+    fx.default_with_runtime();
+    fx.register("personal", &fx.default(), true);
+    let plan = plan_remove(&fx.paths, &sys, "personal").unwrap().unwrap();
+    finish_remove(&fx.paths, "personal", &plan).unwrap();
+    assert!(!session_mirror::Manifest::file(&fx.paths).exists());
 }
 
 #[test]
@@ -413,13 +520,13 @@ fn remove_waits_for_a_running_profile_and_never_follows_links_or_leaves_the_mana
     let outside = fx._home.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
     let entry = ProfileEntry { dir: outside.clone(), protected: false, from: None };
-    assert!(finish_remove(&fx.paths, "team", &entry).is_err());
+    assert!(finish_remove(&fx.paths, "team", &RemovePlan::Delete(entry)).is_err());
     assert!(outside.exists());
 
     let linked = fx.root().join("linked");
     std::os::unix::fs::symlink(&outside, &linked).unwrap();
     let entry = ProfileEntry { dir: linked.clone(), protected: false, from: None };
-    assert!(finish_remove(&fx.paths, "team", &entry).is_err());
+    assert!(finish_remove(&fx.paths, "team", &RemovePlan::Delete(entry)).is_err());
     assert!(outside.exists(), "a symlinked profile is never followed");
 }
 

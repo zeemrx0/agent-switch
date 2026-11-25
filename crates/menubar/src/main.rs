@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 
+use agent_switch_core::adapters::claude_desktop;
 use agent_switch_core::config::Config;
 use agent_switch_core::paths::Paths;
 use agent_switch_core::state::{now_secs, State};
@@ -156,7 +157,7 @@ fn run_app() -> i32 {
     }));
     spawn_ticker(proxy.clone());
 
-    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, last_notice: None, force_offer: None, watcher_running: true, counter: 0 };
+    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, last_notice: None, pending_result: None, force_offer: None, watcher_running: true, counter: 0 };
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
@@ -208,6 +209,9 @@ struct App {
     force_rebuild: bool,
     /// The latest action result, kept in the menu because notifications may be denied.
     last_notice: Option<String>,
+    /// The result of a confirmed Log out, waiting for the tray menu to close before its dialog opens. A newer
+    /// result replaces an older one.
+    pending_result: Option<String>,
     /// A refused busy switch the menu can force; the menu drops it after `menu::FORCE_OFFER_SECS`.
     force_offer: Option<ForceOffer>,
     watcher_running: bool,
@@ -230,8 +234,20 @@ impl App {
         self.refresh();
     }
 
+    /// Open the dialog of a queued result unless the tray menu is open. A modal dialog started while AppKit
+    /// tracks the menu would fight it for the event loop, so the ticker retries after the menu closes.
+    fn show_pending_result(&mut self) {
+        if menu_is_open() {
+            return;
+        }
+        if let Some(body) = self.pending_result.take() {
+            confirm::inform("Log out", &body);
+        }
+    }
+
     /// Rebuild the menu when what it shows has changed, or when a click asked for it.
     fn refresh(&mut self) {
+        self.show_pending_result();
         let entries = current_menu(&self.paths, self.watcher_running, self.last_notice.as_deref(), self.force_offer.clone());
         if !menu::should_rebuild(&entries, &self.shown, self.force_rebuild) {
             return;
@@ -279,11 +295,8 @@ impl App {
     /// default button, so Return cancels.
     fn ask_to_log_out(&mut self, id: &str) {
         let label = Config::load(&self.paths).map_or_else(|_| id.to_string(), |c| menu::label_of(&c, id));
-        if confirm::ask(
-            &format!("Log out {label}?"),
-            "Its saved login is deleted from agent-switch, and surfaces that use it become unmanaged. The login that Claude, Codex or agy holds is not touched.",
-            "Log out",
-        ) {
+        let keeps_folder = claude_desktop::manage::releases_original_folder(&self.paths, id);
+        if confirm::ask(&format!("Log out {label}?"), &menu::log_out_detail(&label, keeps_folder), "Log out") {
             self.confirmed(Action::LogOut(id.to_string()));
         }
         self.refresh();
@@ -307,7 +320,13 @@ impl App {
                 }
                 Err(e) => log_line(&format!("cannot read the config for a notification: {e}")),
             },
-            Report::Notice { title, body } => self.notice(&title, &body),
+            Report::Notice { title, body, dialog } => {
+                self.notice(&title, &body);
+                if dialog {
+                    self.pending_result = Some(body);
+                    self.show_pending_result();
+                }
+            }
             Report::Busy { kind, account, titles } => {
                 self.force_offer = Some(ForceOffer { kind, account, titles, since: now_secs() });
                 self.force_rebuild = true;
@@ -339,8 +358,11 @@ impl App {
     fn notice(&mut self, title: &str, body: &str) {
         self.last_notice = Some(if title == "agent-switch" { body.to_string() } else { format!("{title}: {body}") });
         self.counter += 1;
-        let note = Note::info(format!("{}-{}", now_secs(), self.counter), title, body);
-        self.post(&note);
+        log_line(&format!("{title}: {body}"));
+        // The log line above is the only record when there is no notifier.
+        if let Some(n) = &self.notifier {
+            n.post(&Note::info(format!("{}-{}", now_secs(), self.counter), title, body));
+        }
     }
 
     fn post(&self, note: &Note) {

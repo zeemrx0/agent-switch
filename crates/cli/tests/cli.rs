@@ -111,6 +111,46 @@ fn remove_refuses_a_bound_account_then_removes_it_once_unbound() {
     assert!(!cfg.contains("personal"), "{cfg}");
 }
 
+fn write_desktop_registry(home: &Path, link: bool, dir: &Path) {
+    let file = home.join("Library/Application Support/agent-switch/claude-desktop/profiles.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let body = serde_json::json!({"version": 1, "link": link, "profiles": {"personal": {"dir": dir, "protected": true}}});
+    std::fs::write(file, body.to_string()).unwrap();
+}
+
+#[test]
+fn remove_of_the_account_that_owns_claude_desktops_folder_keeps_the_folder() {
+    let home = tempfile::tempdir().unwrap();
+    write_config(home.path(), TWO_ACCOUNTS);
+    let original = home.path().join("Library/Application Support/Claude");
+    std::fs::create_dir_all(&original).unwrap();
+    std::fs::write(original.join("config.json"), b"keep me").unwrap();
+    write_desktop_registry(home.path(), false, &original);
+
+    let o = run(home.path(), &["remove", "personal"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("kept Claude Desktop's own folder"), "{}", text(&o));
+    assert_eq!(std::fs::read(original.join("config.json")).unwrap(), b"keep me");
+    assert!(!std::fs::read_to_string(config_path(home.path())).unwrap().contains("personal"));
+    let registry = home.path().join("Library/Application Support/agent-switch/claude-desktop/profiles.json");
+    assert!(!std::fs::read_to_string(registry).unwrap().contains("personal"));
+}
+
+#[test]
+fn remove_of_the_original_folders_account_is_refused_while_default_link_is_on() {
+    let home = tempfile::tempdir().unwrap();
+    write_config(home.path(), TWO_ACCOUNTS);
+    let original = home.path().join("Library/Application Support/agent-switch/claude-desktop/personal");
+    std::fs::create_dir_all(&original).unwrap();
+    write_desktop_registry(home.path(), true, &original);
+
+    let o = run(home.path(), &["remove", "personal"]);
+    assert!(!o.status.success());
+    assert!(text(&o).contains("default-link disable"), "{}", text(&o));
+    assert!(std::fs::read_to_string(config_path(home.path())).unwrap().contains("personal"));
+    assert!(original.exists());
+}
+
 #[test]
 fn switch_needs_a_bound_surface() {
     let home = tempfile::tempdir().unwrap();

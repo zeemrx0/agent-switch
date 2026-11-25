@@ -107,8 +107,8 @@ pub fn claude_code_pids(procs: &[ProcInfo], profile_dirs: &[PathBuf]) -> Vec<u32
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileEntry {
     pub dir: PathBuf,
-    /// The original Claude data (moved or registered in place). `remove`, uninstall and a repeated `add`
-    /// refuse to delete it.
+    /// The original Claude data (moved or registered in place). agent-switch never deletes it: `remove` only
+    /// forgets it, and uninstall and a repeated `add` leave it alone.
     #[serde(default)]
     pub protected: bool,
     /// The folder `add --from-profile` cloned this profile from.

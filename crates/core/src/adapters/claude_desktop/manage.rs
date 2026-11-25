@@ -84,7 +84,14 @@ fn copy_desktop_config(from_profile: &Path, to_profile: &Path) -> Result<Option<
 }
 
 pub(super) fn register(paths: &Paths, id: &str, entry: ProfileEntry) -> Result<()> {
+    let config = Config::load(paths)?;
     Registry::update(paths, |r| {
+        // A protected entry whose account is gone is what an interrupted release leaves behind. It owns
+        // nothing, so it must not block the folder from being registered again.
+        let orphan = r.entry_for_dir(&entry.dir).filter(|(other, e)| *other != id && e.protected && config.account(other).is_none()).map(|(other, _)| other.clone());
+        if let Some(orphan) = orphan {
+            r.profiles.remove(&orphan);
+        }
         if let Some((other, _)) = r.entry_for_dir(&entry.dir) {
             if other != id {
                 return Err(Error::Invalid(format!("the folder {} is already the profile of `{other}`", entry.dir.display())));
@@ -474,37 +481,70 @@ pub fn disable_default_link(env: &Env, sys: &dyn System, quit: &QuitOpts, reask:
 // remove
 // ---------------------------------------------------------------------------------------------
 
-/// Run before `remove` deletes an account: refuse while the profile is protected or in use. Returns the
-/// entry whose folder `finish_remove` deletes afterwards.
-pub fn plan_remove(paths: &Paths, sys: &dyn System, id: &str) -> Result<Option<ProfileEntry>> {
+/// Fragments of the refusals `plan_remove` returns. Callers that reword a refusal match on these, and the
+/// messages are built from them, so the two cannot drift apart.
+pub const REFUSAL_LINK_ON: &str = "default-link is on";
+pub const REFUSAL_LINK_POINTS: &str = "currently points at the profile of";
+pub const REFUSAL_RUNNING: &str = "Claude is running on the profile of";
+
+/// What removing an account does with its Desktop profile folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovePlan {
+    /// A managed folder that agent-switch created: `finish_remove` deletes it.
+    Delete(ProfileEntry),
+    /// The app's own original folder: `finish_remove` only forgets it. The folder stays as it is.
+    Release(ProfileEntry),
+}
+
+/// Whether removing `id` releases the app's original folder instead of deleting a managed one.
+pub fn releases_original_folder(paths: &Paths, id: &str) -> bool {
+    Registry::load(paths).is_ok_and(|r| !r.link && r.profiles.get(id).is_some_and(|e| e.protected))
+}
+
+/// Run before `remove` deletes an account: refuse while its profile is in use. A protected entry (the app's
+/// original folder) is released, not deleted, unless the default-link is on. The result tells `finish_remove`
+/// what to do with the folder.
+pub fn plan_remove(paths: &Paths, sys: &dyn System, id: &str) -> Result<Option<RemovePlan>> {
     let registry = Registry::load(paths)?;
     let Some(entry) = registry.profiles.get(id) else { return Ok(None) };
     if entry.protected {
-        return Err(Error::Invalid(format!(
-            "`{id}` owns the protected Claude Desktop folder {} (the original Claude data). agent-switch never deletes it; \
-             leave the account in place, or remove the folder yourself after checking the backup",
-            entry.dir.display()
-        )));
+        if registry.link {
+            return Err(Error::Invalid(format!(
+                "`{id}` owns Claude Desktop's original data folder, now at {}, and {REFUSAL_LINK_ON} (the default folder is linked to the active profile). \
+                 Turn default-link off first (`agent-switch default-link disable`), then remove `{id}` again",
+                entry.dir.display()
+            )));
+        }
+        return Ok(Some(RemovePlan::Release(entry.clone())));
     }
     let default = default_profile(paths);
     if let Ok(LinkState::Symlink(to)) = link_state(&default) {
         if same_dir(&to, &entry.dir) {
             return Err(Error::Invalid(format!(
-                "the Claude default folder {} currently points at the profile of `{id}`. Deleting it would leave the link dangling. Switch Claude Desktop to another account first, then remove `{id}`",
+                "the Claude default folder {} {REFUSAL_LINK_POINTS} `{id}`. Deleting it would leave the link dangling. Switch Claude Desktop to another account first, then remove `{id}`",
                 default.display()
             )));
         }
     }
     let busy = instances(&sys.processes()?, &CLAUDE).iter().any(|i| same_dir(i.profile.as_deref().unwrap_or(&default), &entry.dir));
     if busy {
-        return Err(Error::Invalid(format!("Claude is running on the profile of `{id}`; quit it before removing the account")));
+        return Err(Error::Invalid(format!("{REFUSAL_RUNNING} `{id}`; quit it before removing the account")));
     }
-    Ok(Some(entry.clone()))
+    Ok(Some(RemovePlan::Delete(entry.clone())))
 }
 
-/// Delete a managed, unprotected profile folder and its registry entry. The folder must sit directly inside
-/// the managed folder and must not be a symlink.
-pub fn finish_remove(paths: &Paths, id: &str, entry: &ProfileEntry) -> Result<()> {
+/// Carry out a `RemovePlan`. `Delete` removes a managed, unprotected profile folder (directly inside the
+/// managed folder, not a symlink) and its registry entry. `Release` removes the registry entry only and
+/// never touches the folder; the session-mirror record of the folder moves to the id `default`, the name the
+/// mirror gives a default folder that no account owns.
+pub fn finish_remove(paths: &Paths, id: &str, plan: &RemovePlan) -> Result<()> {
+    match plan {
+        RemovePlan::Delete(entry) => delete_managed(paths, id, entry),
+        RemovePlan::Release(entry) => release_original(paths, id, entry),
+    }
+}
+
+fn delete_managed(paths: &Paths, id: &str, entry: &ProfileEntry) -> Result<()> {
     let root = canon(&profiles_root(paths));
     let managed = entry.dir.parent().is_some_and(|p| canon(p) == root);
     let real = fs::symlink_metadata(&entry.dir).map(|m| m.is_dir() && !m.file_type().is_symlink());
@@ -521,4 +561,20 @@ pub fn finish_remove(paths: &Paths, id: &str, entry: &ProfileEntry) -> Result<()
         r.profiles.remove(id);
         Ok(())
     })
+}
+
+fn release_original(paths: &Paths, id: &str, entry: &ProfileEntry) -> Result<()> {
+    Registry::update(paths, |r| {
+        if r.link {
+            return Err(Error::Invalid(format!("`{id}` owns the original folder and {REFUSAL_LINK_ON}; turn default-link off first")));
+        }
+        r.profiles.remove(id);
+        Ok(())
+    })?;
+    // Only the app's default folder is known to the mirror as `default`.
+    if canon(&entry.dir) == canon(&default_profile(paths)) {
+        session_mirror::rename_profile(paths, id, "default")
+            .map_err(|e| Error::Invalid(format!("`{id}` was released, but its session-mirror record could not be renamed to `default`: {e}")))?;
+    }
+    Ok(())
 }

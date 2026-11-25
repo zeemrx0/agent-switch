@@ -16,6 +16,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use agent_switch_core::adapters::chatgpt_desktop::ChatgptDesktop;
+use agent_switch_core::adapters::claude_desktop::manage::{RemovePlan, REFUSAL_LINK_ON, REFUSAL_LINK_POINTS, REFUSAL_RUNNING};
 use agent_switch_core::adapters::claude_desktop::{self, ClaudeDesktop};
 use agent_switch_core::adapters::surface_for;
 use agent_switch_core::config::{Binding, Config, SurfaceKind};
@@ -42,8 +43,9 @@ pub enum Cmd {
 pub enum Report {
     /// A watcher event, already written to the event log.
     Event(Event),
-    /// Something the user should read: the result of a click, or why it did nothing.
-    Notice { title: String, body: String },
+    /// Something the user should read: the result of a click, or why it did nothing. `dialog` also shows it in
+    /// a dialog, for a click the user confirmed in one.
+    Notice { title: String, body: String, dialog: bool },
     /// A Desktop switch was refused because these sessions are mid-reply; the menu offers "Switch anyway".
     Busy { kind: SurfaceKind, account: Option<String>, titles: String },
     /// Config or state may have changed.
@@ -179,16 +181,19 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
             Ok(Cmd::Do(action)) => {
                 let wakes_watcher = matches!(action, Action::SetSurfaceAuto(_, true));
                 let forceable = forceable_kind(&action);
+                let confirmed = matches!(action, Action::LogOut(_));
                 let outcome = catch_unwind(AssertUnwindSafe(|| job.handle(action)));
                 match outcome {
-                    Ok(Ok(Some(body))) => report(Report::Notice { title: "agent-switch".into(), body }),
+                    Ok(Ok(Some(body))) => report(Report::Notice { title: "agent-switch".into(), body, dialog: confirmed }),
                     Ok(Ok(None)) => {}
                     Ok(Err(e)) => {
                         let text = e.to_string();
                         if let (Some((kind, account)), Some(titles)) = (forceable, claude_desktop::session_mirror::busy_titles_in(&text)) {
                             report(Report::Busy { kind, account, titles });
                         }
-                        report(Report::Notice { title: "agent-switch could not finish".into(), body: text });
+                        // A log out's text starts with its own verdict, so it needs no title in front of it.
+                        let title = if confirmed { "agent-switch" } else { "agent-switch could not finish" };
+                        report(Report::Notice { title: title.into(), body: text, dialog: confirmed });
                     }
                     Err(_) => break "an action panicked".to_string(),
                 }
@@ -301,17 +306,23 @@ impl Job<'_> {
 
     /// Remove `id` from agent-switch like `agent-switch remove`, in one locked step. Every surface that is
     /// bound to the account or has it active becomes unmanaged, because the plain removal refuses an
-    /// account in use. The login that the provider's own app holds is not touched.
+    /// account in use. The login that the provider's own app holds is not touched, and neither is Claude
+    /// Desktop's original data folder. The text starts with the verdict, so a cut-off keeps it.
     fn log_out(&self, id: &str) -> Result<String> {
         let paths = self.env.paths;
         let label = label_of(&Config::load(paths)?, id);
         // Refuses, before anything changes, while Claude Desktop holds the account's profile.
         let plan = || claude_desktop::manage::plan_remove(paths, &SystemApps, id).map_err(|e| desktop_refusal(&label, e));
-        let (_, profile) = switch::remove_account_unmanaging(paths, self.env.vault, id, plan)?;
-        if let Some(entry) = profile {
-            claude_desktop::manage::finish_remove(paths, id, &entry)?;
+        let (_, profile) = switch::remove_account_unmanaging(paths, self.env.vault, id, plan).map_err(|e| not_logged_out(&label, &e))?;
+        let mut said = format!("{label} was logged out: its saved login was removed from agent-switch.");
+        if let Some(plan) = profile {
+            let released = matches!(plan, RemovePlan::Release(_));
+            claude_desktop::manage::finish_remove(paths, id, &plan).map_err(|e| Error::Invalid(format!("{label} was logged out, but a follow-up step failed: {e}")))?;
+            if released {
+                said.push_str(&format!(" Claude Desktop's own data folder was kept. It stays signed in as {label} until you sign out inside Claude."));
+            }
         }
-        Ok(format!("Logged out {label}: its saved login was removed from agent-switch."))
+        Ok(said)
     }
 
     /// Do what a click asked for. `Ok(Some(text))` is a message for the user.
@@ -389,13 +400,19 @@ impl Job<'_> {
 /// The refusal of `plan_remove`, worded for the menu: what stopped the log out and what to do.
 fn desktop_refusal(label: &str, cause: Error) -> Error {
     let Error::Invalid(text) = &cause else { return cause };
-    if text.contains("protected Claude Desktop folder") {
-        Error::Invalid(format!("{label} holds the original Claude Desktop data, which agent-switch never deletes, so it cannot be logged out."))
-    } else if text.contains("default folder") || text.contains("Claude is running") {
-        Error::Invalid(format!("{label} is in use by Claude Desktop. Switch Claude Desktop to another account and quit Claude, then log out {label} again."))
+    if text.contains(REFUSAL_LINK_ON) {
+        Error::Invalid(format!("Claude's default folder is linked to {label}'s data (default-link is on). Run `agent-switch default-link disable` in Terminal, then log out {label} again."))
+    } else if text.contains(REFUSAL_LINK_POINTS) || text.contains(REFUSAL_RUNNING) {
+        Error::Invalid(format!("Claude Desktop is using this account. Switch Claude Desktop to another account and quit Claude, then log out {label} again."))
     } else {
         cause
     }
+}
+
+/// "Personal was not logged out: <reason>", the verdict first.
+fn not_logged_out(label: &str, cause: &Error) -> Error {
+    let reason = cause.to_string();
+    Error::Invalid(format!("{label} was not logged out: {}.", reason.trim_end_matches('.')))
 }
 
 /// "Claude Desktop is on Team." plus the session-mirroring result when there is one.
@@ -602,7 +619,8 @@ mod tests {
             State::update(&h.paths, |s| s.set_active(SurfaceKind::ClaudeCli, Some("a".into()))).unwrap();
 
             let said = job.handle(Action::LogOut("a".into())).unwrap().unwrap();
-            assert!(said.contains("Logged out A"), "{said}");
+            assert!(said.starts_with("A was logged out"), "{said}");
+            assert!(!said.contains("data folder"), "{said}");
             let c = Config::load(&h.paths).unwrap();
             assert!(c.account("a").is_none() && c.account("b").is_some());
             assert_eq!(c.surfaces.claude_desktop, Binding::Unmanaged);
@@ -625,13 +643,71 @@ mod tests {
 
     #[test]
     fn a_desktop_refusal_says_why_and_what_to_do_in_menu_words() {
-        let in_use = Error::Invalid("the Claude default folder /x currently points at the profile of `a`. Switch Claude Desktop to another account first, then remove `a`".into());
-        let said = desktop_refusal("Alpha", in_use).to_string();
-        assert!(said.contains("Alpha is in use by Claude Desktop") && said.contains("Switch Claude Desktop to another account") && !said.contains("remove"), "{said}");
-        let protected = Error::Invalid("`a` owns the protected Claude Desktop folder /x (the original Claude data).".into());
-        assert!(desktop_refusal("Alpha", protected).to_string().contains("original Claude Desktop data"));
+        for marker in [REFUSAL_LINK_POINTS, REFUSAL_RUNNING] {
+            let in_use = Error::Invalid(format!("the Claude default folder /x {marker} `a`. Switch Claude Desktop to another account first, then remove `a`"));
+            let said = desktop_refusal("Alpha", in_use).to_string();
+            assert!(said.contains("Claude Desktop is using this account") && said.contains("log out Alpha again") && !said.contains("remove"), "{said}");
+        }
+        let linked = Error::Invalid(format!("`a` owns Claude Desktop's original data folder, and {REFUSAL_LINK_ON}. Turn default-link off first"));
+        let said = desktop_refusal("Alpha", linked).to_string();
+        assert!(said.contains("default-link is on") && said.contains("agent-switch default-link disable") && said.contains("log out Alpha again"), "{said}");
         let other = Error::NotFound("account `a`".into());
         assert!(matches!(desktop_refusal("Alpha", other), Error::NotFound(_)));
+    }
+
+    #[test]
+    fn the_verdict_comes_first_in_a_refusal() {
+        let said = not_logged_out("Alpha", &Error::Invalid("Claude Desktop is using this account.".into())).to_string();
+        assert_eq!(said, "Alpha was not logged out: Claude Desktop is using this account.");
+    }
+
+    /// The original Claude Desktop folder with a file in it, registered in place for account `a`.
+    fn register_original(h: &Home) -> std::path::PathBuf {
+        use agent_switch_core::adapters::claude_desktop::{default_profile, ProfileEntry, Registry};
+        let original = default_profile(&h.paths);
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::write(original.join("config.json"), b"keep me").unwrap();
+        Registry::update(&h.paths, |r| {
+            r.profiles.insert("a".into(), ProfileEntry { dir: original.clone(), protected: true, from: None });
+            Ok(())
+        })
+        .unwrap();
+        original
+    }
+
+    #[test]
+    fn logging_out_the_original_folders_account_keeps_the_folder_and_says_so() {
+        use agent_switch_core::adapters::claude_desktop::Registry;
+        let h = home();
+        let original = register_original(&h);
+        with_job(&h, |job| {
+            let said = job.handle(Action::LogOut("a".into())).unwrap().unwrap();
+            assert!(said.starts_with("A was logged out"), "{said}");
+            assert!(said.contains("Claude Desktop's own data folder was kept") && said.contains("signed in as A until you sign out inside Claude"), "{said}");
+        });
+        assert_eq!(std::fs::read(original.join("config.json")).unwrap(), b"keep me");
+        assert!(Config::load(&h.paths).unwrap().account("a").is_none());
+        assert!(!Registry::load(&h.paths).unwrap().profiles.contains_key("a"));
+    }
+
+    #[test]
+    fn logging_out_while_the_default_link_is_on_changes_nothing_and_says_why() {
+        use agent_switch_core::adapters::claude_desktop::Registry;
+        let h = home();
+        let original = register_original(&h);
+        Registry::update(&h.paths, |r| {
+            r.link = true;
+            Ok(())
+        })
+        .unwrap();
+        with_job(&h, |job| {
+            let err = job.handle(Action::LogOut("a".into())).unwrap_err().to_string();
+            assert!(err.starts_with("A was not logged out: "), "{err}");
+            assert!(err.contains("default-link is on") && err.contains("agent-switch default-link disable"), "{err}");
+        });
+        assert!(Config::load(&h.paths).unwrap().account("a").is_some());
+        assert!(Registry::load(&h.paths).unwrap().profiles.contains_key("a"));
+        assert_eq!(std::fs::read(original.join("config.json")).unwrap(), b"keep me");
     }
 
     #[test]
@@ -639,7 +715,7 @@ mod tests {
         let h = home();
         with_job(&h, |job| {
             let err = job.handle(Action::LogOut("nope".into())).unwrap_err().to_string();
-            assert!(err.contains("nope"), "{err}");
+            assert!(err.contains("was not logged out") && err.contains("nope"), "{err}");
             assert_eq!(Config::load(&h.paths).unwrap().accounts.len(), 2);
         });
     }

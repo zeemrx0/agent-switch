@@ -109,7 +109,7 @@ agent-switch add claude-desktop team-claude --from-profile <profile dir>
 agent-switch add antigravity-cli --id work-agy [--label Work]
 ```
 
-Claude Desktop's own folder is registered in place and protected from removal. Any other `--from-profile` folder is cloned (APFS copy-on-write) into the managed folder. MCP `env` values in the Desktop config are copied as is; the command lists the key names.
+Claude Desktop's own folder is registered in place and protected: agent-switch never deletes it and never rewrites its login or settings. Only the optional session mirroring writes session files into it. Any other `--from-profile` folder is cloned (APFS copy-on-write) into the managed folder. MCP `env` values in the Desktop config are copied as is; the command lists the key names.
 
 ### Bind and switch
 
@@ -119,6 +119,7 @@ agent-switch bind codex-cli unmanaged             # stop managing a surface
 agent-switch switch claude-cli team-claude        # one-off activation, binding unchanged
 agent-switch switch claude-desktop team-claude --restart   # --restart consents to quitting the app
 agent-switch remove <account>                     # refused while the account is bound or active
+                                                  # (the account that owns Claude Desktop's own folder is removed, the folder is kept)
 ```
 
 Desktop switches never quit an app without `--restart` (or a click on the menu bar notification).
@@ -135,7 +136,7 @@ Desktop keeps the Code-tab session list per profile, so a new account used to op
 
 ### Auto mode
 
-Auto-switching runs inside the menu bar app (one watcher at a time). Each provider section of the menu has a `CLI: <account>` and a `Desktop: <account>` submenu (Antigravity has only the CLI one). In each one you pick the account (or "Leave unmanaged"), turn auto-switch on or off for that surface, and set the order in which auto-switch uses the accounts ("Priority", with "Move up" and "Move down"). The account rows above them show which surfaces use each account and its usage. Each account row opens a submenu with "Use for CLI", "Use for Desktop", its usage and "Log out". "Log out" asks for confirmation, then does what `agent-switch remove` does: it deletes the saved login from agent-switch and drops the account from the config. Surfaces that are bound to the account or use it become unmanaged in the same step. Claude Desktop refuses the log out while it runs on the account's profile: switch it to another account first. The login that Claude Code, Codex or `agy` holds is not touched.
+Auto-switching runs inside the menu bar app (one watcher at a time). Each provider section of the menu has a `CLI: <account>` and a `Desktop: <account>` submenu (Antigravity has only the CLI one). In each one you pick the account (or "Leave unmanaged"), turn auto-switch on or off for that surface, and set the order in which auto-switch uses the accounts ("Priority", with "Move up" and "Move down"). The account rows above them show which surfaces use each account and its usage. Each account row opens a submenu with "Use for CLI", "Use for Desktop", its usage and "Log out". "Log out" asks for confirmation, then does what `agent-switch remove` does: it deletes the saved login from agent-switch and drops the account from the config. Surfaces that are bound to the account or use it become unmanaged in the same step. Claude Desktop refuses the log out while it runs on the account's profile: switch it to another account first. The account that owns Claude Desktop's own data folder (`~/Library/Application Support/Claude`) can be logged out too: agent-switch drops the account and its registry entry and leaves the folder untouched, so Claude Desktop stays signed in as that account until you sign out inside Claude. While `default-link` is on, that account's log out is refused: run `agent-switch default-link disable` first. After a confirmed log out, a dialog shows the result (done or the reason it was refused), and the notice line at the top of the menu starts with the same verdict. Every result is also written to `~/Library/Logs/agent-switch/menubar.log`. The login that Claude Code, Codex or `agy` holds is not touched.
 
 The "Add account" submenu has one item per provider. It opens Terminal and runs the matching `agent-switch add` command, which signs in a new account (for Antigravity, sign in with `agy` first; the window asks for an account id). Below them, "Save current Claude Code login" and "Save current ChatGPT and Codex login" save the login that the app already holds, with `--from-keychain-item "Claude Code-credentials"` and `--from-file ~/.codex/auth.json`. The menu lists only saved accounts, so use these after you sign in directly in Claude Code or Codex. The Terminal window says whether an account was saved, and the menu shows it within a few seconds.
 
