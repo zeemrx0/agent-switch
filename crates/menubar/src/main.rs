@@ -92,8 +92,8 @@ fn main() {
 }
 
 /// The menu for what is on disk now.
-fn current_menu(paths: &Paths, watcher_running: bool, notice: Option<&str>, force_offer: Option<ForceOffer>) -> Vec<Entry> {
-    let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, notice: notice.map(str::to_string), force_offer };
+fn current_menu(paths: &Paths, watcher_running: bool, force_offer: Option<ForceOffer>) -> Vec<Entry> {
+    let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, force_offer };
     match (Config::load(paths), State::load(paths)) {
         (Ok(config), Ok(state)) => menu::build(&config, &state, &ctx),
         (Err(e), _) | (_, Err(e)) => menu::error_menu(&e.to_string(), &ctx),
@@ -103,7 +103,7 @@ fn current_menu(paths: &Paths, watcher_running: bool, notice: Option<&str>, forc
 fn print_menu() -> i32 {
     match Paths::from_env() {
         Ok(paths) => {
-            print!("{}", menu::to_text(&current_menu(&paths, true, None, None)));
+            print!("{}", menu::to_text(&current_menu(&paths, true, None)));
             0
         }
         Err(e) => {
@@ -158,7 +158,7 @@ fn run_app() -> i32 {
     }));
     spawn_ticker(proxy.clone());
 
-    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, last_notice: None, pending_result: None, force_offer: None, watcher_running: true, counter: 0 };
+    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, pending_result: None, force_offer: None, watcher_running: true, counter: 0 };
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
@@ -168,7 +168,6 @@ fn run_app() -> i32 {
                 // The native check item flips on every click, so the menu is rebuilt after any click, even on
                 // an item that has no action.
                 app.force_rebuild = true;
-                app.last_notice = None;
                 app.force_offer = None; // any click, including "Switch anyway" itself, uses up the offer
                 match app.actions.get(&id).cloned() {
                     Some(action) => app.dispatch(action, flow),
@@ -209,7 +208,6 @@ struct App {
     /// Set by a click: the next refresh rebuilds even when the model is unchanged.
     force_rebuild: bool,
     /// The latest action result, kept in the menu because notifications may be denied.
-    last_notice: Option<String>,
     /// The result of a confirmed Log out, waiting for the tray menu to close before its dialog opens. A newer
     /// result replaces an older one.
     pending_result: Option<String>,
@@ -249,7 +247,7 @@ impl App {
     /// Rebuild the menu when what it shows has changed, or when a click asked for it.
     fn refresh(&mut self) {
         self.show_pending_result();
-        let entries = current_menu(&self.paths, self.watcher_running, self.last_notice.as_deref(), self.force_offer.clone());
+        let entries = current_menu(&self.paths, self.watcher_running, self.force_offer.clone());
         if !menu::should_rebuild(&entries, &self.shown, self.force_rebuild) {
             return;
         }
@@ -357,7 +355,6 @@ impl App {
     }
 
     fn notice(&mut self, title: &str, body: &str) {
-        self.last_notice = Some(if title == "agent-switch" { body.to_string() } else { format!("{title}: {body}") });
         self.counter += 1;
         log_line(&format!("{title}: {body}"));
         // The log line above is the only record when there is no notifier.

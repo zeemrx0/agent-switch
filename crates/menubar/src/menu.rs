@@ -223,8 +223,6 @@ pub struct Ctx {
     pub login: LoginStatus,
     /// False once the watcher thread has ended.
     pub watcher_running: bool,
-    /// The result of the latest click, shown as a disabled line because notifications may be denied.
-    pub notice: Option<String>,
     /// A refused busy switch that the user may force; ignored once it is older than `FORCE_OFFER_SECS`.
     pub force_offer: Option<ForceOffer>,
 }
@@ -469,7 +467,7 @@ fn footer(config: &Config, ctx: &Ctx) -> Vec<Entry> {
         Entry::Separator,
         login_entry(&ctx.login),
     ];
-    vec![Entry::Submenu { text: "Settings".into(), entries: settings }, Entry::item("Quit", Action::Quit)]
+    vec![Entry::Submenu { text: "Settings".into(), entries: settings }, version_entry(), Entry::item("Quit", Action::Quit)]
 }
 
 /// The detail of the Log out dialog. `keeps_folder` is true for the account that owns Claude Desktop's own
@@ -489,10 +487,6 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     if let Some(offer) = ctx.force_offer.as_ref().filter(|o| ctx.now.saturating_sub(o.since) < FORCE_OFFER_SECS) {
         let titles = clean_to(&offer.titles, MAX_NOTICE_CHARS - 30);
         out.push(Entry::item(format!("Switch anyway (ends: {titles})"), Action::ForceRelaunch { kind: offer.kind, account: offer.account.clone(), titles: offer.titles.clone() }));
-        out.push(Entry::Separator);
-    }
-    if let Some(notice) = &ctx.notice {
-        out.push(Entry::Label(format!("Last: {}", clean_to(notice, MAX_NOTICE_CHARS))));
         out.push(Entry::Separator);
     }
     if !ctx.watcher_running {
@@ -521,14 +515,14 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     }
     if !any {
         out.push(Entry::disabled("No saved accounts"));
-        out.push(Entry::disabled("Signed in already? Add account > Save current login"));
+        out.push(Entry::disabled("Signed in already? Add account > Import current login"));
         out.push(Entry::Separator);
     }
     let mut add: Vec<Entry> = Provider::ALL.into_iter().map(|p| Entry::item(format!("{}…", provider_title(p)), Action::AddAccount(p))).collect();
     add.push(Entry::Separator);
     // Antigravity has no row here: its item above already saves the login that `agy` holds.
-    add.push(Entry::item("Save current Claude Code login", Action::SaveCurrentLogin(Provider::Claude)));
-    add.push(Entry::item("Save current ChatGPT and Codex login", Action::SaveCurrentLogin(Provider::Openai)));
+    add.push(Entry::item("Import current Claude Code login", Action::SaveCurrentLogin(Provider::Claude)));
+    add.push(Entry::item("Import current ChatGPT and Codex login", Action::SaveCurrentLogin(Provider::Openai)));
     out.push(Entry::Submenu { text: "Add account".into(), entries: add });
     out.extend(footer(config, ctx));
     out
@@ -541,8 +535,14 @@ pub fn error_menu(message: &str, ctx: &Ctx) -> Vec<Entry> {
         Entry::Label(clean(message)),
         Entry::Separator,
         login_entry(&ctx.login),
+        version_entry(),
         Entry::item("Quit", Action::Quit),
     ]
+}
+
+/// The app version, as a disabled line above "Quit".
+fn version_entry() -> Entry {
+    Entry::Label(format!("Version {}", env!("CARGO_PKG_VERSION")))
 }
 
 /// Plain text of the menu, for `--print-menu` and for reading test failures.
@@ -678,7 +678,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, notice: None, force_offer: None }
+        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, force_offer: None }
     }
 
     fn find_row<'a>(entries: &'a [Entry], name: &str) -> &'a AccountRow {
@@ -725,8 +725,8 @@ mod tests {
         c.add_account(account("g1", Provider::Antigravity, "G One")).unwrap();
         c.add_account(account("g2", Provider::Antigravity, "G Two")).unwrap();
         let menu = build(&c, &State::default(), &ctx());
-        // 3 providers + 5 accounts + 3 separators + Add account + Settings + Quit.
-        assert_eq!(menu.len(), 14, "{}", to_text(&menu));
+        // 3 providers + 5 accounts + 3 separators + Add account + Settings + Version + Quit.
+        assert_eq!(menu.len(), 15, "{}", to_text(&menu));
     }
 
     #[test]
@@ -889,10 +889,10 @@ Claude >
     fn without_any_account_the_menu_says_so_and_still_offers_add_account() {
         let text = to_text(&build(&Config::default(), &State::default(), &ctx()));
         assert!(
-            text.starts_with("No saved accounts (disabled)\nSigned in already? Add account > Save current login (disabled)\n--------\nAdd account >\n"),
+            text.starts_with("No saved accounts (disabled)\nSigned in already? Add account > Import current login (disabled)\n--------\nAdd account >\n"),
             "{text}"
         );
-        assert!(text.contains("Save current Claude Code login") && text.contains("Save current ChatGPT and Codex login"), "{text}");
+        assert!(text.contains("Import current Claude Code login") && text.contains("Import current ChatGPT and Codex login"), "{text}");
     }
 
     #[test]
@@ -923,8 +923,8 @@ Claude >
                 Entry::item("ChatGPT and Codex…", Action::AddAccount(Provider::Openai)),
                 Entry::item("Antigravity…", Action::AddAccount(Provider::Antigravity)),
                 Entry::Separator,
-                Entry::item("Save current Claude Code login", Action::SaveCurrentLogin(Provider::Claude)),
-                Entry::item("Save current ChatGPT and Codex login", Action::SaveCurrentLogin(Provider::Openai)),
+                Entry::item("Import current Claude Code login", Action::SaveCurrentLogin(Provider::Claude)),
+                Entry::item("Import current ChatGPT and Codex login", Action::SaveCurrentLogin(Provider::Openai)),
             ]
         );
         assert!(!to_text(&menu).contains("Add account…"), "no per-provider rows");
@@ -971,13 +971,12 @@ Claude >
     fn busy_refusal_offers_switch_anyway() {
         let c = config();
         let offer = ForceOffer { kind: SurfaceKind::ClaudeDesktop, account: None, titles: "Fix login, Refactor".into(), since: NOW };
-        let menu = build(&c, &State::default(), &Ctx { force_offer: Some(offer.clone()), notice: Some("refused".into()), ..ctx() });
+        let menu = build(&c, &State::default(), &Ctx { force_offer: Some(offer.clone()), ..ctx() });
         assert_eq!(menu[0], Entry::item(
                 "Switch anyway (ends: Fix login, Refactor)",
                 Action::ForceRelaunch { kind: SurfaceKind::ClaudeDesktop, account: None, titles: "Fix login, Refactor".into() }
             ), "top item");
         assert_eq!(menu[1], Entry::Separator);
-        assert_eq!(menu[2], Entry::Label("Last: refused".into()));
         // The offer lapses after ten minutes and is absent when there was no refusal.
         let late = build(&c, &State::default(), &Ctx { now: NOW + FORCE_OFFER_SECS, force_offer: Some(offer), ..ctx() });
         assert!(!to_text(&late).contains("Switch anyway"));
@@ -1055,22 +1054,14 @@ Claude >
     }
 
     #[test]
-    fn the_latest_notice_is_a_disabled_line_at_the_top_and_gone_when_cleared() {
-        let c = config();
-        let with = build(&c, &State::default(), &Ctx { notice: Some("Claude Desktop now uses Team\nsecond line".into()), ..ctx() });
-        assert_eq!(with[0], Entry::Label("Last: Claude Desktop now uses Team second line".into()));
-        assert!(!to_text(&build(&c, &State::default(), &ctx())).contains("Last:"));
-    }
-
-    #[test]
-    fn a_long_log_out_refusal_keeps_its_verdict_in_the_notice_line() {
-        let reason = "Claude's default folder is linked to Personal's data (default-link is on). Run `agent-switch default-link disable` in Terminal, then log out Personal again.";
-        let notice = format!("Personal was not logged out: {reason}");
-        assert!(notice.chars().count() > MAX_NOTICE_CHARS);
-        let menu = build(&config(), &State::default(), &Ctx { notice: Some(notice), ..ctx() });
-        let Entry::Label(line) = &menu[0] else { panic!("no notice line in\n{}", to_text(&menu)) };
-        assert!(line.starts_with("Last: Personal was not logged out: Claude's default folder"), "{line}");
-        assert!(line.ends_with('…') && line.chars().count() <= "Last: ".len() + MAX_NOTICE_CHARS);
+    fn the_footer_shows_the_app_version_right_above_quit() {
+        let version = Entry::Label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        for menu in [build(&config(), &State::default(), &ctx()), error_menu("broken", &ctx())] {
+            let n = menu.len();
+            assert_eq!(menu[n - 2], version, "{}", to_text(&menu));
+            assert_eq!(menu[n - 1], Entry::item("Quit", Action::Quit));
+        }
+        assert!(!to_text(&build(&config(), &State::default(), &ctx())).contains("Last:"));
     }
 
     #[test]

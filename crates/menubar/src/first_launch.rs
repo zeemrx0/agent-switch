@@ -29,7 +29,7 @@ fn who(email: Option<&str>, id: &str) -> String {
     email.map(mask_email).unwrap_or_else(|| id.to_string())
 }
 
-/// "Saved your Claude Code login (a***@example.com) and ChatGPT login (b***@example.com)." Each part is left
+/// "Imported your Claude Code login (a***@example.com) and ChatGPT login (b***@example.com)." Each part is left
 /// out when that login was not saved. Each name is the masked email, else the account id.
 pub fn saved_notice(claude: Option<&ClaudeImported>, chatgpt: Option<&CodexImported>) -> String {
     let mut parts = Vec::new();
@@ -39,7 +39,7 @@ pub fn saved_notice(claude: Option<&ClaudeImported>, chatgpt: Option<&CodexImpor
     if let Some(o) = chatgpt {
         parts.push(format!("ChatGPT login ({})", who(o.login.email.as_deref(), &o.id)));
     }
-    format!("Saved your {}.", parts.join(" and "))
+    format!("Imported your {}.", parts.join(" and "))
 }
 
 fn import_claude(env: &Env, claude: &ClaudeCode) -> Result<ClaudeImported, String> {
@@ -173,7 +173,7 @@ mod tests {
         let fx = Fx::new();
         fx.sign_in();
         let Outcome::Saved { notice, .. } = fx.check(Some("jane@example.com")) else { panic!("nothing was saved") };
-        assert_eq!(notice, format!("Saved your Claude Code login ({}).", mask_email("jane@example.com")));
+        assert_eq!(notice, format!("Imported your Claude Code login ({}).", mask_email("jane@example.com")));
         assert!(!notice.contains("jane@"), "{notice}");
         let config = Config::load(&fx.paths).unwrap();
         assert_eq!(config.accounts.len(), 1);
@@ -187,7 +187,7 @@ mod tests {
         let fx = Fx::new();
         fx.sign_in();
         let Outcome::Saved { notice, .. } = fx.check(None) else { panic!("nothing was saved") };
-        assert_eq!(notice, "Saved your Claude Code login (claude-uuid-f).");
+        assert_eq!(notice, "Imported your Claude Code login (claude-uuid-f).");
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
         let fx = Fx::new();
         fx.codex_login(Some("bob@example.com"), "acct-1");
         let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
-        assert_eq!(notice, format!("Saved your ChatGPT login ({}).", mask_email("bob@example.com")));
+        assert_eq!(notice, format!("Imported your ChatGPT login ({}).", mask_email("bob@example.com")));
         assert!(!notice.contains("bob@"), "{notice}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert!(skipped[0].starts_with("no Claude Code login was saved on the first launch"), "{skipped:?}");
@@ -265,7 +265,7 @@ mod tests {
         let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
         assert_eq!(
             notice,
-            format!("Saved your Claude Code login ({}) and ChatGPT login ({}).", mask_email("jane@example.com"), mask_email("bob@example.com"))
+            format!("Imported your Claude Code login ({}) and ChatGPT login ({}).", mask_email("jane@example.com"), mask_email("bob@example.com"))
         );
         assert!(skipped.is_empty(), "{skipped:?}");
         let config = Config::load(&fx.paths).unwrap();
@@ -280,7 +280,7 @@ mod tests {
         fx.codex_login(None, "acct-1");
         let (notice, _) = saved(fx.check(None));
         let id = &Config::load(&fx.paths).unwrap().accounts[0].id;
-        assert_eq!(notice, format!("Saved your ChatGPT login ({id})."));
+        assert_eq!(notice, format!("Imported your ChatGPT login ({id})."));
     }
 
     #[test]
@@ -288,7 +288,7 @@ mod tests {
         let fx = Fx::new();
         fx.sign_in();
         let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
-        assert_eq!(notice, format!("Saved your Claude Code login ({}).", mask_email("jane@example.com")));
+        assert_eq!(notice, format!("Imported your Claude Code login ({}).", mask_email("jane@example.com")));
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert!(skipped[0].starts_with("no ChatGPT login was saved on the first launch"), "{skipped:?}");
         assert!(skipped[0].contains("no auth.json"), "{skipped:?}");
@@ -301,7 +301,7 @@ mod tests {
         std::fs::create_dir_all(fx.paths.home().join(".codex")).unwrap();
         std::fs::write(fx.paths.home().join(".codex/auth.json"), "not json").unwrap();
         let (notice, skipped) = saved(fx.check(Some("jane@example.com")));
-        assert!(notice.starts_with("Saved your Claude Code login"), "{notice}");
+        assert!(notice.starts_with("Imported your Claude Code login"), "{notice}");
         assert!(!notice.contains("ChatGPT"), "{notice}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert!(skipped[0].starts_with("no ChatGPT login was saved on the first launch"), "{skipped:?}");
