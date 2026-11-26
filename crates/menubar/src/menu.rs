@@ -143,11 +143,12 @@ fn rate_limited(rec: Option<&UsageRecord>) -> bool {
     rec.is_some_and(|r| r.state == UsageState::Unreadable && r.detail.as_deref() == Some("http-429"))
 }
 
-/// The bars of a reading: one per window it has. A rate-limited or expired record keeps its bars while its
-/// last reading is fresh. None when there is no reading or it is not a clean one (dead, unreadable, or
-/// rate limited or expired with an old reading); `usage` then gives the note instead.
+/// The bars of a reading: one per window it has. An expired record keeps the bars of its last reading at
+/// any age, since it only waits for the next use to refresh; a rate-limited one keeps them while the reading
+/// is fresh. None when there is no reading or it is not a clean one (dead, unreadable, or rate limited with
+/// an old reading); `usage` then gives the note instead.
 pub fn usage_bars(rec: Option<&UsageRecord>, now: u64, threshold: u8) -> Vec<Bar> {
-    let keeps_last_reading = |r: &UsageRecord| (r.state == UsageState::Expired || rate_limited(Some(r))) && !policy::is_stale(Some(r), now);
+    let keeps_last_reading = |r: &UsageRecord| r.state == UsageState::Expired || (rate_limited(Some(r)) && !policy::is_stale(Some(r), now));
     let Some(r) = rec.filter(|r| r.state == UsageState::Ok || keeps_last_reading(r)) else { return Vec::new() };
     [("5h", &r.windows.five_hour), ("wk", &r.windows.weekly)]
         .into_iter()
@@ -371,11 +372,13 @@ fn info_lines(rec: Option<&UsageRecord>, usage: &Usage, now: u64) -> Vec<Entry> 
     }
     if let Some(at) = rec.fetched_at {
         let age = now.saturating_sub(at);
-        out.push(Entry::disabled(match (rate_limited(Some(rec)), age < 60) {
-            (true, true) => "Rate limited · last read just now".to_string(),
-            (true, false) => format!("Rate limited · last read {} ago", span(age)),
-            (false, true) => "Updated just now".to_string(),
-            (false, false) => format!("Updated {} ago", span(age)),
+        let ago = if age < 60 { "just now".to_string() } else { format!("{} ago", span(age)) };
+        out.push(Entry::disabled(if rate_limited(Some(rec)) {
+            format!("Rate limited · last read {ago}")
+        } else if rec.state == UsageState::Expired && policy::is_stale(Some(rec), now) {
+            format!("Refreshes on use · last read {ago}")
+        } else {
+            format!("Updated {ago}")
         }));
     }
     out
@@ -811,7 +814,7 @@ mod tests {
         assert_eq!(team[3..5], [Entry::disabled("no reading yet"), Entry::Separator], "no reading: only the note");
 
         // A window that already reset has no reset time; a failed reading shows only its note.
-        s.usage.insert("team".into(), UsageRecord { state: UsageState::Expired, ..reading(1.0, 1.0) });
+        s.usage.insert("team".into(), UsageRecord { state: UsageState::Expired, ..UsageRecord::default() });
         s.usage.insert("personal".into(), reading(10.0, 20.0));
         let later = build(&c, &s, &Ctx { now: NOW + 86_400 + 60, ..ctx() });
         assert_eq!(find_row(&later, "Personal").children[3], Entry::disabled("5h: 0% used"));
@@ -1005,7 +1008,7 @@ Claude >
         let mut r = reading(32.0, 40.0);
         assert_eq!(usage(Some(&r), NOW, 90), bars((32, Tier::Plenty), (40, Tier::Plenty)));
         assert_eq!(usage_text(&usage(Some(&r), NOW, 90)), "5h 32% · wk 40%");
-        for (state, note) in [(UsageState::Expired, "refreshes on use"), (UsageState::Dead, "sign in again"), (UsageState::Unreadable, "unreadable")] {
+        for (state, note) in [(UsageState::Dead, "sign in again"), (UsageState::Unreadable, "unreadable")] {
             r.state = state;
             r.fetched_at = Some(NOW - policy::STALE_AFTER_S - 1);
             assert_eq!(usage(Some(&r), NOW, 90), Usage::Note(note), "{state:?}");
@@ -1156,7 +1159,7 @@ Claude >
             assert!(usage_bars(Some(&UsageRecord { state: bad, ..reading(10.0, 20.0) }), NOW, 90).is_empty(), "{bad:?}");
         }
         let stale_expired = UsageRecord { state: UsageState::Expired, fetched_at: Some(NOW - policy::STALE_AFTER_S - 1), ..reading(10.0, 20.0) };
-        assert!(usage_bars(Some(&stale_expired), NOW, 90).is_empty());
+        assert_eq!(usage_bars(Some(&stale_expired), NOW, 90).len(), 2, "an expired account keeps its last reading at any age");
         assert!(usage_bars(Some(&UsageRecord::default()), NOW, 90).is_empty());
     }
 
@@ -1336,12 +1339,16 @@ Claude >
     }
 
     #[test]
-    fn an_expired_account_with_an_old_reading_says_it_refreshes_on_use() {
+    fn an_expired_account_with_an_old_reading_shows_that_reading_and_says_it_refreshes_on_use() {
         let mut r = reading(32.0, 40.0);
         r.state = UsageState::Expired;
-        r.fetched_at = Some(NOW - policy::STALE_AFTER_S - 1);
-        assert_eq!(usage(Some(&r), NOW, 90), Usage::Note("refreshes on use"));
-        assert_eq!(usage(Some(&UsageRecord { state: UsageState::Expired, ..UsageRecord::default() }), NOW, 90), Usage::Note("refreshes on use"));
+        r.fetched_at = Some(NOW - 2 * 86_400);
+        assert_eq!(usage(Some(&r), NOW, 90), bars((32, Tier::Plenty), (40, Tier::Plenty)), "the last status, not a note");
+        let mut s = State::default();
+        s.usage.insert("personal".into(), r);
+        let text = to_text(&find_row(&build(&config(), &s, &ctx()), "Personal").children);
+        assert!(text.contains("Refreshes on use · last read 2d"), "{text}");
+        assert_eq!(usage(Some(&UsageRecord { state: UsageState::Expired, ..UsageRecord::default() }), NOW, 90), Usage::Note("refreshes on use"), "no reading at all");
     }
 
     #[test]
