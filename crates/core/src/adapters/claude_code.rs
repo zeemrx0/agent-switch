@@ -293,6 +293,16 @@ fn merge_login(live: Option<&Obj>, target_login: &Obj) -> Obj {
     merged
 }
 
+/// Drop `mcpOAuth` entries that hold neither an access nor a refresh token (Claude Code's rebuildable
+/// discovery cache). Returns whether anything was removed.
+fn prune_tokenless_mcp(login: &mut Obj) -> bool {
+    let Some(Value::Object(servers)) = login.get_mut("mcpOAuth") else { return false };
+    let empty = |e: &Obj, k: &str| e.get(k).is_none_or(|v| v.is_null() || v.as_str() == Some(""));
+    let before = servers.len();
+    servers.retain(|_, v| !matches!(v, Value::Object(e) if empty(e, "accessToken") && empty(e, "refreshToken")));
+    servers.len() != before
+}
+
 /// Compact JSON restricted to printable ASCII, the form `security -i` accepts.
 fn compact_ascii(obj: &Obj) -> Result<String> {
     let text = serde_json::to_string(obj).map_err(|e| Error::Invalid(e.to_string()))?;
@@ -768,10 +778,16 @@ impl ClaudeCode {
             (Some(l), true) => account_bound(l),
             _ => target.login.clone(),
         };
-        let merged = merge_login(live.as_ref(), &target_login);
-        let merged_text = compact_ascii(&merged)?;
-        // Fail closed before any write when the live item's stdin limit cannot carry the result.
-        encode_add_line(&service, &setup.user, &merged_text).map_err(|e| match e {
+        let mut merged = merge_login(live.as_ref(), &target_login);
+        let mut merged_text = compact_ascii(&merged)?;
+        // Fail closed before any write when the live item's stdin limit cannot carry the result. Tokenless
+        // MCP discovery stubs are dropped from the written login first, and only when needed to fit.
+        let mut line = encode_add_line(&service, &setup.user, &merged_text);
+        if matches!(line, Err(Error::TooLarge { .. })) && prune_tokenless_mcp(&mut merged) {
+            merged_text = compact_ascii(&merged)?;
+            line = encode_add_line(&service, &setup.user, &merged_text);
+        }
+        line.map_err(|e| match e {
             Error::TooLarge { len, limit } => Error::Invalid(format!(
                 "the merged Claude login is too large for /usr/bin/security's stdin limit ({len} > {limit} bytes), and agent-switch never puts tokens on a command line. Nothing was changed. Remove unused MCP logins from Claude Code to shrink it"
             )),

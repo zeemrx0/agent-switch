@@ -792,6 +792,47 @@ fn a_login_that_does_not_fit_the_stdin_limit_fails_before_any_write() {
 }
 
 #[test]
+fn pruning_drops_only_tokenless_mcp_entries() {
+    let mut l = with(login("a", "r"), "mcpOAuth", json!({
+        "stub": {"serverName": "s", "accessToken": ""},
+        "null": {"accessToken": null, "refreshToken": null},
+        "bare": {"serverName": "b"},
+        "access": {"accessToken": "tok", "refreshToken": ""},
+        "refresh": {"accessToken": "", "refreshToken": "rt"},
+        "scalar": 1,
+    }));
+    assert!(prune_tokenless_mcp(&mut l));
+    let kept: HashSet<&str> = l["mcpOAuth"].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(kept, HashSet::from(["access", "refresh", "scalar"]));
+    assert!(!prune_tokenless_mcp(&mut l), "nothing left to drop");
+
+    let mut only_stubs = with(login("a", "r"), "mcpOAuth", json!({"stub": {"accessToken": ""}}));
+    assert!(prune_tokenless_mcp(&mut only_stubs));
+    assert_eq!(only_stubs["mcpOAuth"], json!({}), "an emptied mcpOAuth stays an empty object");
+    assert!(!prune_tokenless_mcp(&mut login("a", "r")), "no mcpOAuth key");
+}
+
+#[test]
+fn tokenless_mcp_stubs_are_dropped_only_when_the_login_would_not_fit() {
+    let fx = Fx::new();
+    let mut mcp = serde_json::Map::new();
+    for i in 0..40 {
+        mcp.insert(format!("plugin:x:srv{i}|{i:016x}"), json!({"serverName": "s", "serverUrl": "https://example.com/mcp", "accessToken": "", "discoveryState": {"pad": "y".repeat(80)}}));
+    }
+    mcp.insert("real|1".into(), json!({"serverName": "real", "accessToken": "mcp-tok", "refreshToken": "mcp-ref"}));
+    let mut live = fx.live_obj();
+    live.insert("mcpOAuth".into(), Value::Object(mcp));
+    fx.set_live(&live);
+    assert!(compact_ascii(&merge_login(Some(&live), &login("acc-T1", "ref-T1"))).unwrap().len() > 4090, "fixture must exceed the limit");
+
+    fx.switch(&fx.adapter(), "team").unwrap();
+
+    let after = fx.live_obj();
+    assert_eq!(access(&after), "acc-T1");
+    assert_eq!(after["mcpOAuth"], json!({"real|1": {"serverName": "real", "accessToken": "mcp-tok", "refreshToken": "mcp-ref"}}));
+}
+
+#[test]
 fn unreadable_live_storage_fails_closed() {
     let fx = Fx::new();
     fx.live.set(LIVE_SERVICE, USER, "{\"somethingElse\":1}").unwrap();
