@@ -221,11 +221,11 @@ pub struct ForceOffer {
     pub since: u64,
 }
 
-/// How long the menu keeps showing a Desktop switch that the worker has not reported finished. It only
+/// How long the menu keeps showing a switch that the worker has not reported finished. It only
 /// guards against a lost completion signal; a switch takes seconds to a minute.
 pub const SWITCHING_SECS: u64 = 120;
 
-/// A Desktop switch the worker is carrying out: the menu already shows `account` as the app's account.
+/// A switch the worker is carrying out: the menu already shows `account` as the account of `kind`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingSwitch {
     pub kind: SurfaceKind,
@@ -234,10 +234,12 @@ pub struct PendingSwitch {
     pub since: u64,
 }
 
-/// The Desktop switch that `action` starts, if it is one that targets an account.
+/// The switch that `action` starts, if it is one that targets an account: a Desktop `SwitchApp` or forced
+/// relaunch, or a CLI pick (`Bind` to an account).
 pub fn switch_target(action: &Action) -> Option<(SurfaceKind, String)> {
     match action {
         Action::SwitchApp(kind, id) | Action::ForceRelaunch { kind, account: Some(id), .. } if kind.is_desktop() => Some((*kind, id.clone())),
+        Action::Bind(kind, Binding::Account(id)) if !kind.is_desktop() => Some((*kind, id.clone())),
         _ => None,
     }
 }
@@ -250,7 +252,7 @@ pub struct Ctx {
     pub watcher_running: bool,
     /// A refused busy switch that the user may force; ignored once it is older than `FORCE_OFFER_SECS`.
     pub force_offer: Option<ForceOffer>,
-    /// A Desktop switch in progress; ignored once it is older than `SWITCHING_SECS`.
+    /// A switch in progress; ignored once it is older than `SWITCHING_SECS`.
     pub switching: Option<PendingSwitch>,
     /// Accounts that have a registered Claude Desktop profile, or that the app's own folder is signed in as
     /// (the switch registers it). Without either, "Use for Desktop" cannot work.
@@ -545,8 +547,11 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
             continue;
         }
         any = true;
-        let cli_current = policy::current_account(config, state, cli);
         // A switch in progress shows its target right away; the real state catches up when it ends.
+        let cli_current = match switching {
+            Some(p) if p.kind == cli => Some(p.account.clone()),
+            _ => policy::current_account(config, state, cli),
+        };
         let app_current = app.and_then(|app| match switching {
             Some(p) if p.kind == app => Some(p.account.clone()),
             _ => policy::current_account(config, state, app),
@@ -1052,6 +1057,31 @@ Claude >
         assert_eq!(late, plain);
     }
 
+    fn cli_checked(menu: &[Entry], name: &str) -> (bool, bool) {
+        let row = find_row(menu, name);
+        let checked = row.children.iter().any(|e| matches!(e, Entry::Item { text, checked: Some(true), .. } if text == "Use for CLI"));
+        (row.cli, checked)
+    }
+
+    #[test]
+    fn a_cli_switch_in_progress_shows_its_target_as_the_cli_account() {
+        let c = config();
+        let plain = build(&c, &State::default(), &ctx());
+        assert_eq!(cli_checked(&plain, "Personal"), (true, true));
+        assert_eq!(cli_checked(&plain, "Team"), (false, false));
+        assert!(!to_text(&plain).contains("Switching"), "no switch, no line");
+
+        let pending = PendingSwitch { kind: SurfaceKind::ClaudeCli, account: "team".into(), since: NOW };
+        let menu = build(&c, &State::default(), &Ctx { switching: Some(pending.clone()), ..ctx() });
+        assert_eq!(menu[0], Entry::disabled("Switching Claude CLI to Team…"));
+        assert_eq!(cli_checked(&menu, "Team"), (true, true));
+        assert_eq!(cli_checked(&menu, "Personal"), (false, false));
+        assert_eq!(desktop_checked(&menu, "Team"), desktop_checked(&plain, "Team"), "the Desktop account is untouched");
+
+        let late = build(&c, &State::default(), &Ctx { now: NOW + SWITCHING_SECS, switching: Some(pending), ..ctx() });
+        assert_eq!(late, plain);
+    }
+
     #[test]
     fn a_chatgpt_desktop_switch_moves_only_that_apps_account() {
         let mut c = config();
@@ -1066,7 +1096,7 @@ Claude >
     }
 
     #[test]
-    fn only_a_desktop_click_that_names_an_account_is_a_switch() {
+    fn only_a_click_that_names_an_account_is_a_switch() {
         let claude = SurfaceKind::ClaudeDesktop;
         assert_eq!(switch_target(&Action::SwitchApp(claude, "a".into())), Some((claude, "a".into())));
         assert_eq!(switch_target(&Action::SwitchApp(SurfaceKind::ChatgptDesktop, "a".into())), Some((SurfaceKind::ChatgptDesktop, "a".into())));
@@ -1074,7 +1104,9 @@ Claude >
         assert_eq!(switch_target(&forced), Some((claude, "a".into())));
         assert_eq!(switch_target(&Action::ForceRelaunch { kind: claude, account: None, titles: "t".into() }), None);
         assert_eq!(switch_target(&Action::RelaunchApp(claude)), None);
-        assert_eq!(switch_target(&Action::Bind(SurfaceKind::ClaudeCli, Binding::parse("a"))), None);
+        assert_eq!(switch_target(&Action::Bind(SurfaceKind::ClaudeCli, Binding::parse("a"))), Some((SurfaceKind::ClaudeCli, "a".into())));
+        assert_eq!(switch_target(&Action::Bind(SurfaceKind::CodexCli, Binding::parse("a"))), Some((SurfaceKind::CodexCli, "a".into())));
+        assert_eq!(switch_target(&Action::Bind(SurfaceKind::ClaudeCli, Binding::Unmanaged)), None);
     }
 
     #[test]

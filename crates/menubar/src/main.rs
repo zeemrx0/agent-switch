@@ -17,6 +17,8 @@ mod worker;
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_switch_core::adapters::claude_desktop;
@@ -34,6 +36,8 @@ use crate::notify::{Note, Notifier};
 use crate::worker::{Handle, Report, StartError};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
+/// How often a refresh that was skipped because the tray menu was open is retried.
+const MENU_RETRY_EVERY: Duration = Duration::from_millis(100);
 const STOP_WAIT: Duration = Duration::from_secs(15);
 const LOG_ROTATE_BYTES: u64 = 1 << 20;
 const USAGE: &str = "usage: agent-switch-menubar [--print-menu | --notify-test | --help | --version]\n\
@@ -175,7 +179,7 @@ fn run_app() -> i32 {
     }));
     spawn_ticker(proxy.clone());
 
-    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, pending_result: None, force_offer: None, switching: None, watcher_running: true, counter: 0 };
+    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, retrying: Arc::new(AtomicBool::new(false)), pending_result: None, force_offer: None, switching: None, watcher_running: true, counter: 0 };
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
@@ -224,13 +228,16 @@ struct App {
     shown: Vec<Entry>,
     /// Set by a click: the next refresh rebuilds even when the model is unchanged.
     force_rebuild: bool,
+    /// True while a short-interval retry runs because a refresh was skipped with the menu open; the retry
+    /// stops once a refresh runs with the menu closed.
+    retrying: Arc<AtomicBool>,
     /// The latest action result, kept in the menu because notifications may be denied.
     /// The result of a confirmed Log out, waiting for the tray menu to close before its dialog opens. A newer
     /// result replaces an older one.
     pending_result: Option<(String, String)>,
     /// A refused busy switch the menu can force; the menu drops it after `menu::FORCE_OFFER_SECS`.
     force_offer: Option<ForceOffer>,
-    /// The Desktop switch the worker is running; the menu shows its target as current until the worker
+    /// The switch the worker is running; the menu shows its target as current until the worker
     /// reports it done (or `menu::SWITCHING_SECS` pass).
     switching: Option<PendingSwitch>,
     watcher_running: bool,
@@ -267,12 +274,17 @@ impl App {
     /// Rebuild the menu when what it shows has changed, or when a click asked for it.
     fn refresh(&mut self) {
         self.show_pending_result();
+        if !menu_is_open() {
+            self.retrying.store(false, Ordering::Relaxed);
+        }
         let entries = current_menu(&self.paths, self.watcher_running, self.force_offer.clone(), self.switching.clone());
         if !menu::should_rebuild(&entries, &self.shown, self.force_rebuild) {
             return;
         }
-        // Replacing the menu while it is open closes it under the pointer. Wait; the ticker tries again.
+        // Replacing the menu while it is open closes it under the pointer. Wait, and retry soon after it closes
+        // so a reopened menu is not stale until the next tick.
         if menu_is_open() {
+            self.retry_soon();
             return;
         }
         match menu::render(&entries) {
@@ -286,6 +298,23 @@ impl App {
             }
             Err(e) => log_line(&format!("cannot build the menu: {e}")),
         }
+    }
+
+    /// Ask for a refresh every `MENU_RETRY_EVERY` until one runs with the menu closed. One retry thread at a
+    /// time; it sleeps between sends, so the main thread never waits.
+    fn retry_soon(&self) {
+        if self.retrying.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (proxy, retrying) = (self.proxy.clone(), Arc::clone(&self.retrying));
+        std::thread::spawn(move || {
+            while retrying.load(Ordering::Relaxed) {
+                std::thread::sleep(MENU_RETRY_EVERY);
+                if proxy.send_event(UserEvent::Refresh).is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     fn dispatch(&mut self, action: Action, flow: &mut ControlFlow) {

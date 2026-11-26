@@ -53,7 +53,7 @@ pub enum Report {
     Busy { kind: SurfaceKind, account: Option<String>, titles: String },
     /// Config or state may have changed.
     Changed,
-    /// The worker finished one action, whatever its outcome. `switch` names the Desktop switch the action was,
+    /// The worker finished one action, whatever its outcome. `switch` names the switch (Desktop or CLI) the action was,
     /// so the menu can stop showing it as in progress.
     Done { switch: Option<(SurfaceKind, String)> },
     /// The thread ended; the text says why.
