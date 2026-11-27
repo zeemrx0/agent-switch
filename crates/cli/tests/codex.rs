@@ -66,6 +66,23 @@ fn shell_init_exports_codex_home_only_when_the_cli_has_its_own_account() {
 }
 
 #[test]
+fn codex_home_prints_the_cli_home_only_when_the_cli_has_its_own_account() {
+    let home = tempfile::tempdir().unwrap();
+    write_config(home.path(), &format!("{ACCOUNTS}\n[surfaces]\nchatgpt-desktop = \"team-openai\"\ncodex-cli = \"personal-openai\"\n"));
+    let o = run(home.path(), &["codex-home"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(text(&o), format!("{}\n", home.path().join(".agent-switch/codex-cli").display()));
+
+    write_config(home.path(), &format!("{ACCOUNTS}\n[surfaces]\nchatgpt-desktop = \"team-openai\"\ncodex-cli = \"team-openai\"\n"));
+    let o = run(home.path(), &["codex-home"]);
+    assert!(o.status.success() && o.stdout.is_empty(), "bound together: nothing: {}", text(&o));
+
+    write_config(home.path(), ACCOUNTS);
+    let o = run(home.path(), &["codex-home"]);
+    assert!(o.status.success() && o.stdout.is_empty(), "unmanaged: nothing: {}", text(&o));
+}
+
+#[test]
 fn add_openai_dry_run_picks_the_newest_copy_and_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
     let old = home.path().join("old.json");

@@ -101,6 +101,8 @@ enum Command {
     },
     /// Print shell code that points the Codex CLI at its own login (use: eval "$(agent-switch shell-init)")
     ShellInit,
+    /// Print the Codex CLI's own CODEX_HOME for programs started without a terminal (prints nothing when the CLI shares ~/.codex)
+    CodexHome,
     /// Check config, state, keychain backend and saved logins
     Doctor,
     /// Claude Code's status line command (reads its JSON on stdin, takes the quota reading, then runs your
@@ -139,6 +141,7 @@ fn main() {
         Command::DefaultLink { action, dry_run } => desktop_commands::default_link(&action, dry_run),
         Command::DesktopSessions { action, dry_run } => desktop_commands::desktop_sessions(&action, dry_run),
         Command::ShellInit => codex_commands::shell_init(),
+        Command::CodexHome => codex_commands::codex_home(),
         Command::Doctor => commands::doctor(),
         Command::Statusline { action: Some(StatuslineAction::Install) } => statusline_command::install(),
         Command::Statusline { action: Some(StatuslineAction::Uninstall) } => statusline_command::uninstall(),

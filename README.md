@@ -83,6 +83,8 @@ eval "$(agent-switch shell-init)"
 
 It prints nothing when the Codex CLI shares `~/.codex`. The export applies only to terminal shells, so the ChatGPT app, which reads your shell environment, keeps `~/.codex`. Shells that are already open keep their old environment.
 
+A program that starts the Codex CLI without a terminal can run `agent-switch codex-home`. It prints the CLI's own `CODEX_HOME` path, or nothing when the CLI shares `~/.codex`.
+
 ## Use
 
 ```sh

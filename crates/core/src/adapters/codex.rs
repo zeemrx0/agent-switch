@@ -366,18 +366,23 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The Codex CLI's own `CODEX_HOME` when it has one, for programs that start it without a terminal.
+pub fn cli_home(paths: &Paths, config: &Config) -> Option<PathBuf> {
+    cli_separate(paths, config).then(|| shallow_dir(paths))
+}
+
 /// What `eval "$(agent-switch shell-init)"` runs: the `CODEX_HOME` export when the CLI has its own account
 /// (only in shells with a terminal), and nothing otherwise.
 pub fn shell_init(paths: &Paths, config: &Config) -> String {
-    if !cli_separate(paths, config) {
+    let Some(home) = cli_home(paths, config) else {
         return String::new();
-    }
+    };
     format!(
         "# agent-switch: the Codex CLI uses its own login; history stays linked to ~/.codex.\n\
          # Shells that are already open keep their old environment: open a new shell or run this again.\n\
          # Shells without a terminal (such as the ChatGPT app reading your environment) are skipped, so the app keeps ~/.codex.\n\
          if [ -t 0 ]; then export CODEX_HOME={}; fi\n",
-        sh_quote(&shallow_dir(paths).display().to_string())
+        sh_quote(&home.display().to_string())
     )
 }
 
@@ -782,6 +787,23 @@ pub mod tests {
 
         cfg.bind(crate::config::SurfaceKind::CodexCli, crate::config::Binding::parse("team")).unwrap();
         assert_eq!(shell_init(&f.paths, &cfg), "", "bound together: nothing");
+    }
+
+    #[test]
+    fn cli_home_is_the_shallow_home_only_for_a_separate_binding() {
+        let f = Fixture::new();
+        f.account("team", "zee@x.com", "acct-1", "rt-1", T0);
+        let personal = auth_json("me@x.com", "acct-2", "plus", "rt-2", T0);
+        import(&f.env(), vec![Copy::parse("p", personal).unwrap()], Some("personal"), None, false).unwrap();
+        let mut cfg = Config::load(&f.paths).unwrap();
+        assert_eq!(cli_home(&f.paths, &cfg), None, "unmanaged");
+
+        cfg.bind(crate::config::SurfaceKind::ChatgptDesktop, crate::config::Binding::parse("team")).unwrap();
+        cfg.bind(crate::config::SurfaceKind::CodexCli, crate::config::Binding::parse("personal")).unwrap();
+        assert_eq!(cli_home(&f.paths, &cfg), Some(shallow_dir(&f.paths)));
+
+        cfg.bind(crate::config::SurfaceKind::CodexCli, crate::config::Binding::parse("team")).unwrap();
+        assert_eq!(cli_home(&f.paths, &cfg), None, "bound together");
     }
 
     #[test]

@@ -89,6 +89,16 @@ pub fn shell_init() -> Result<i32> {
     Ok(0)
 }
 
+/// `agent-switch codex-home`: the Codex CLI's own `CODEX_HOME` and a newline, or nothing when it shares `~/.codex`.
+pub fn codex_home() -> Result<i32> {
+    let app = App::open()?;
+    let config = Config::load(&app.paths)?;
+    if let Some(home) = codex::cli_home(&app.paths, &config) {
+        println!("{}", home.display());
+    }
+    Ok(0)
+}
+
 /// The ChatGPT adapter for `switch chatgpt-desktop --restart`: the flag is consent to quit the app. Other
 /// processes using `~/.codex` are stopped only after a yes on the terminal.
 pub fn chatgpt_with_quit() -> ChatgptDesktop {
